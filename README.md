@@ -28,6 +28,7 @@ docker compose --env-file ../.env up --pull=always
 
 docker compose down -v
 docker volume ls
+docker compose logs -f backend
 docker compose ps
 docker compose exec NOMBRE bash
 

@@ -12,7 +12,7 @@ default_args = {
 with DAG(
     dag_id="lakehouse_pipeline",
     default_args=default_args,
-    schedule_interval="@hourly",
+    schedule_interval="@minutely",
     catchup=False
 ) as dag:
 

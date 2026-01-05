@@ -1,11 +1,28 @@
 services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - dataplatform
+
   airflow-webserver:
     image: apache/airflow:3.1.5
-    command: [airflow db-manager reset,airflow db migrate ,airflow api-server]
+    command: >
+      bash -c "
+      airflow db reset -y &&
+      airflow db migrate &&
+      airflow api-server
+      "
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../spark-apps:/opt/spark-apps
@@ -16,17 +33,44 @@ services:
 
   airflow-scheduler:
     image: apache/airflow
-    command: [airflow db-manager reset,airflow db migrate ,airflow scheduler]    
+    command: >
+      bash -c "
+      airflow db migrate &&
+      airflow scheduler
+      "    
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../spark-apps:/opt/spark-apps
     networks:
       - dataplatform
 
+  airflow-init:
+    image: apache/airflow
+    depends_on:
+      - postgres
+    environment:
+      AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      # AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    entrypoint: >
+      bash -c "
+      airflow db reset -y &&
+      airflow users create \
+        --username ${AIRFLOW_USERNAME} \
+        --firstname Admin \
+        --lastname User \
+        --role Admin \
+        --email admin@example.com \
+        --password ${AIRFLOW_PASSWORD}
+      "
+    networks:
+      - dataplatform
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.2.2
@@ -79,11 +123,13 @@ services:
       bash -c "
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic events --partitions 2 --replication-factor 1
       "
+    networks:
+      - dataplatform
 
   producer-1:
     build:
-      dockerfile: ./producer/Dockerfile
-      context: .
+      dockerfile: ./docker/producer/Dockerfile
+      context: ..
     depends_on:
       - kafka
       - kafka-init
@@ -92,8 +138,8 @@ services:
 
   producer-2:
     build: 
-      dockerfile: ./producer/Dockerfile
-      context: .  
+      dockerfile: ./docker/producer/Dockerfile
+      context: ..
     depends_on:
       - kafka
       - kafka-init
@@ -109,6 +155,8 @@ services:
       sleep 15 &&
       kafka-console-consumer --bootstrap-server kafka:9092 --topic events --group spark-group
       "
+    networks:
+      - dataplatform
 
   kafka-consumer-2:
     image: confluentinc/cp-kafka:7.2.2
@@ -119,12 +167,14 @@ services:
       sleep 15 &&
       kafka-console-consumer --bootstrap-server kafka:9092 --topic events --group spark-group
       "
+    networks:
+      - dataplatform
 
   spark-master:
     image: apache/spark
     container_name: spark-master
     volumes:
-      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ../spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
     command: >
       /opt/spark/bin/spark-class
       org.apache.spark.deploy.master.Master
@@ -138,7 +188,6 @@ services:
         condition: service_healthy
       minio2:
         condition: service_healthy
-
 
   spark-worker-1:
     image: apache/spark
@@ -169,7 +218,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
-      - minio_data1:/data
+      - minio_data1a:/data1
+      - minio_data1b:/data2
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -177,7 +227,7 @@ services:
       - dataplatform
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
-      interval: 5s
+      interval: 15s
       timeout: 3s
       retries: 10
 
@@ -188,7 +238,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
-      - minio_data2:/data
+      - minio_data2a:/data1
+      - minio_data2b:/data2
     networks:
       - dataplatform
     healthcheck:
@@ -200,8 +251,8 @@ services:
   minio-init:
     image: quay.io/minio/mc
     depends_on:
-      - minio1
-      - minio2
+      minio1:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
       sleep 15;
@@ -222,10 +273,12 @@ services:
   #   networks:
   #     - dataplatform
 
-
 volumes:
-  minio_data1:
-  minio_data2:
+  postgres_data:
+  minio_data1a:
+  minio_data1b:
+  minio_data2a:
+  minio_data2b:
 
 networks:
   dataplatform:
