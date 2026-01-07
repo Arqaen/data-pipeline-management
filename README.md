@@ -24,12 +24,14 @@ Para ML solo quitar Kafka y Streaming
  
 EJECUTAR EN LA CARPETA DOCKER
 docker compose pull --parallel=false
-docker compose --env-file ../.env up --pull=always 
+docker compose --env-file ../.env up --pull=always --build
 
-docker compose down -v
+docker compose down -v --remove-orphans
+
 docker volume ls
 docker compose logs -f backend
 docker compose ps
 docker compose exec NOMBRE bash
 
 
+cat $AIRFLOW_HOME/simple_auth_manager_passwords.json.generated
