@@ -17,6 +17,7 @@ with DAG(
     max_active_runs=1,
     max_active_tasks=1,
     is_paused_upon_creation=False,
+    tags=["lakehouse", "bronze"]
 ) as dag:
 
     # bronze = SparkSubmitOperator(
@@ -44,8 +45,9 @@ with DAG(
             "spark.sql.shuffle.partitions": "4",
 
             # ===== Ventana Airflow → Spark =====
-            "spark.bronze.window.start": "{{ data_interval_start.int_timestamp * 1000 }}",
-            "spark.bronze.window.end": "{{ data_interval_end.int_timestamp * 1000 }}",
+            "spark.bronze.window.start": "{{ logical_date.int_timestamp * 1000 }}",
+            "spark.bronze.window.end": "{{ (logical_date + macros.timedelta(minutes=5)).int_timestamp * 1000 }}",
+
 
             # ===== Kafka =====
             "spark.kafka.bootstrap.servers": "kafka:9092",
