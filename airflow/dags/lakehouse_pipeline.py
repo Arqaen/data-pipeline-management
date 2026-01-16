@@ -1,6 +1,11 @@
-from airflow import DAG
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from airflow import DAG
+import os
+
+MINIO_USER = os.getenv("MINIO_ROOT_USER")
+MINIO_PASS = os.getenv("MINIO_ROOT_PASSWORD")
 
 default_args = {
     "owner": "data-platform",
@@ -20,17 +25,6 @@ with DAG(
     tags=["lakehouse", "bronze"]
 ) as dag:
 
-    # bronze = SparkSubmitOperator(
-    #     task_id="bronze",
-    #     application="/opt/spark/examples/src/main/python/pi.py",
-    #     conn_id="spark_default",
-    #     name="arrow-spark",
-    #     verbose=True,
-    #     conf={
-    #         "spark.master": "spark://spark-master:7077",
-    #     },
-    # )
-    
     bronze = SparkSubmitOperator(
         task_id="bronze",
         application="/opt/spark-apps/spark_bronze.py",
@@ -53,20 +47,15 @@ with DAG(
             "spark.kafka.bootstrap.servers": "kafka:9092",
             "spark.kafka.topic": "events",
 
-            # ===== Structured Streaming =====
-            "spark.sql.streaming.checkpointLocation": "s3a://bronze/_checkpoints",
-
             # ===== MinIO / S3A =====
             "spark.hadoop.fs.s3a.endpoint": "http://minio1:9000",
             "spark.hadoop.fs.s3a.path.style.access": "true",
             "spark.hadoop.fs.s3a.connection.ssl.enabled": "false",
-            "spark.hadoop.fs.s3a.access.key": "minioadmin",
-            "spark.hadoop.fs.s3a.secret.key": "minioadmin",
+            "spark.hadoop.fs.s3a.access.key": MINIO_USER,
+            "spark.hadoop.fs.s3a.secret.key": MINIO_PASS,
 
             # ===== JARS OBLIGATORIOS =====
             "spark.jars.packages": (
-                "org.apache.hadoop:hadoop-aws:3.3.4,"
-                "com.amazonaws:aws-java-sdk-bundle:1.12.262,"
                 "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,"
                 "org.apache.kafka:kafka-clients:3.5.1"
             ),
