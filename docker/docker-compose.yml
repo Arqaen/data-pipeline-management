@@ -77,6 +77,7 @@ services:
       bash -c "
       airflow db migrate &&
       airflow db check &&
+      airflow connections delete spark_default || true &&
       airflow connections add spark_default \
       --conn-type spark \
       --conn-host spark://spark-master \
@@ -259,8 +260,8 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     restart: always
     volumes:
-      - minio_data1a:/data1
-      - minio_data1b:/data2
+      - ../data/minio1/data1:/data1
+      - ../data/minio1/data2:/data2
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -280,8 +281,8 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     restart: always
     volumes:
-      - minio_data2a:/data1
-      - minio_data2b:/data2
+      - ../data/minio2/data1:/data1
+      - ../data/minio2/data2:/data2
     networks:
       - dataplatform
     healthcheck:
