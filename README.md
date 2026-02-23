@@ -52,5 +52,4 @@ docker compose logs -f backend
 docker compose ps
 docker compose exec NOMBRE bash
 
-
-cat $AIRFLOW_HOME/simple_auth_manager_passwords.json.generated
+docker compose exec -it airflow cat simple_auth_manager_passwords.json.generated

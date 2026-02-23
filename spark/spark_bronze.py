@@ -76,10 +76,10 @@ def main():
     rows = df.count()
     print(f"Rows in window: {rows}")
 
-    if rows == 0:
-        print("No data for this window")
-        spark.stop()
-        sys.exit(0)
+    # if rows == 0:
+    #     print("No data for this window")
+    #     spark.stop()
+    #     sys.exit(0)
 
     # ===== Particiones =====
     df = (
