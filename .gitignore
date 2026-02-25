@@ -7,6 +7,7 @@ venv/
 *.log
 logs
 tmp
+raw/*.csv
 
 # General
 spark-warehouse/
