@@ -5,6 +5,7 @@ __pycache__/
 venv/
 .env
 *.log
+*.png
 logs
 tmp
 raw/*.csv

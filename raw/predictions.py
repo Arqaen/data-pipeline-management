@@ -1,32 +1,16 @@
 from typing import List, Optional, Tuple
-from dataclasses import dataclass
 import pandas as pd
-from sklearn.metrics import accuracy_score, roc_auc_score
-from sklearn.metrics import roc_auc_score
-from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score, mean_squared_error, r2_score
+from scipy.stats import spearmanr
+from xgboost import XGBClassifier,XGBRegressor
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # import yfinance as yf
 # sp500 = yf.download("^GSPC", progress=False, period="max")
 # sp500.reset_index(inplace=True)
 # sp500.to_csv("sp500.csv")
-
-@dataclass
-class Config:
-    input_csv: str = "data.csv"
-    date_col: str = "date"
-    open_col: str = "open"
-    high_col: str = "high"
-    low_col: str = "low"
-    close_col: str = "close"
-    volume_col: str = "volume"
-    target_col: str = "close"
-    feature_cols: Optional[List[str]] = None
-    horizon: int = 1
-    lags: int = 5
-    ma_windows: Tuple[int, ...] = (5, 10, 20)
-    test_size: float = 0.2
-    random_state: int = 42
 
 def correlation_report(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     corr = df[cols].corr()
@@ -37,56 +21,48 @@ def correlation_report(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 def _has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
     return all(c in df.columns for c in cols)
 
-def add_technical_indicators(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    close_col = cfg.close_col if cfg.close_col in df.columns else cfg.target_col
+    close_col = "Close"
+    global horizon
+    h = horizon
 
-    # EMA
-    for w in cfg.ma_windows:
-        df[f"{close_col}_ema_{w}"] = df[close_col].ewm(span=w, adjust=False).mean()
+    # EMAs adaptadas al horizonte
+    short = max(3, h // 2)        
+    mid   = h                   
+    long  = h * 2              
 
-    df["ema_200_dist"] = df["Close"] / df["Close_ema_200"] - 1
-    df["ema_50_dist"]  = df["Close"] / df["Close_ema_50"] - 1
-    # RSI(14)
+    df[f"ema_{short}"] = df[close_col].ewm(span=short, adjust=False).mean()
+    df[f"ema_{mid}"]   = df[close_col].ewm(span=mid, adjust=False).mean()
+    df[f"ema_{long}"]  = df[close_col].ewm(span=long, adjust=False).mean()
+    df[f"ema_{short}_dist"] = df["Close"] / df[f"ema_{short}"] - 1
+    df[f"ema_{mid}_dist"] = df["Close"] / df[f"ema_{mid}"] - 1
+    df[f"ema_{long}_dist"] = df["Close"] / df[f"ema_{long}"] - 1
+
+    df["ema_spread"] = df[f"ema_{short}"] / df[f"ema_{long}"] - 1
+
+    # RSI adaptado
+    rsi_window = 14
     delta = df[close_col].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
+    avg_gain = gain.rolling(rsi_window).mean()
+    avg_loss = loss.rolling(rsi_window).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi_14"] = 100 - (100 / (1 + rs))
+    df[f"rsi_{rsi_window}"] = 100 - (100 / (1 + rs))
 
-    # ROC(12)
-    df["roc_12"] = 100 * (df[close_col] / df[close_col].shift(12) - 1)
-
-    if _has_cols(df, [cfg.high_col, cfg.low_col, close_col]):
-        high = df[cfg.high_col]
-        low = df[cfg.low_col]
-        close_prev = df[close_col].shift(1)
-        tr = pd.concat(
-            [(high - low), (high - close_prev).abs(), (low - close_prev).abs()],
-            axis=1,
-        ).max(axis=1)
-        df["atr_14"] = tr.rolling(14).mean()
-
-        plus_dm = (high.diff()).where((high.diff() > low.diff().abs()) & (high.diff() > 0), 0.0)
-        minus_dm = (low.diff().abs()).where((low.diff().abs() > high.diff()) & (low.diff() < 0), 0.0)
-        tr_smooth = tr.ewm(alpha=1 / 14, adjust=False).mean()
-        plus_di = 100 * (plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / tr_smooth)
-        minus_di = 100 * (minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / tr_smooth)
-        dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
-        df["adx_14"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
+    # ROC alineado al horizonte
+    df[f"roc_{h}"] = df[close_col].pct_change(h)
 
     return df
 
-# FUNCION GENERAL
 def to_monthly_last(df):
     """
     Convierte cualquier serie (diaria/mensual/trimestral)
     a frecuencia mensual usando el último valor disponible del mes.
     """
     df = df.sort_index()
-    # df = df.dropna()
     df = df.resample("M").last()
     df = df.ffill()
     return df
@@ -106,7 +82,7 @@ unemp = pd.read_csv("unemployment.csv", parse_dates=["observation_date"], index_
 sp500 = sp500.drop(columns=["Price", "High", "Low", "Open", "Volume"])
 
 # PASAR A MENSUAL (último dato del mes)
-# balance = to_monthly_last(balance)
+balance = to_monthly_last(balance)
 sp500 = to_monthly_last(sp500)
 corp_profit = to_monthly_last(corp_profit)
 corp_spread = to_monthly_last(corp_spread)
@@ -119,7 +95,7 @@ unemp = to_monthly_last(unemp)
 
 # MERGE
 df = sp500.join([
-    # balance,
+    balance,
     corp_profit,
     corp_spread,
     fund_rate,
@@ -129,37 +105,44 @@ df = sp500.join([
 ], how="left")
 
 
+
+
+
+horizon = 10
+
+
 # FEATURE ENGINEERING 
-# df["balance_yoy"] = df["WALCL"].pct_change(12)
+df["balance_yoy"] = df["WALCL"].pct_change(12)
 df["sp500_12m"] = df["Close"].pct_change(12)
+df["sp500_horizon"] = df["Close"].pct_change(horizon)
 df["gdp_yoy"] = df["GDPC1"].pct_change(12)
 df["unemp_change_12m"] = df["UNRATE"].diff(12)
-df["fund_rate_change_6m"] = df["FEDFUNDS"].diff(12)
+df["fund_rate_change_12m"] = df["FEDFUNDS"].diff(12)
 
+df = add_technical_indicators(df)
+
+h = horizon
+short = max(3, h // 2)       
+mid   = h                     
+long  = h * 2                 
 features = [
     # ===== MACRO =====
+    "balance_yoy",
     "sp500_12m",
+    "sp500_horizon",
     "gdp_yoy",
     "unemp_change_12m",
-    "fund_rate_change_6m",
+    "fund_rate_change_12m",
     "BAMLC0A0CM",
     "BAMLH0A0HYM2",
 
     # ===== TECHNICAL =====
-    "ema_200_dist",
-    "ema_50_dist",
+    f"ema_{short}_dist",
+    f"ema_{mid}_dist",
+    f"ema_{long}_dist",
     "rsi_14",
-    "roc_12",
+    f"roc_{horizon}",
 ]
-
-df = add_technical_indicators(df, Config(
-    target_col="Close",
-    close_col="Close",
-    high_col=None,
-    low_col=None,
-    ma_windows=(20, 50, 200),
-    horizon=10
-))
 
 
 
@@ -173,24 +156,21 @@ df = add_technical_indicators(df, Config(
 
 
 
-# TARGET 10 meses 
-horizon = 10
+# TARGET  
+horizon = horizon
 min_train_size = 180   
 test_size = 48     
 
 
 
-# TARGETS
 df["future_return"] = df["Close"].shift(-horizon) / df["Close"] - 1
-df["target"] = (df["future_return"] > 0).astype(int)
-df = df.dropna(subset=features + ["future_return"])
-
-
+df = df.dropna(subset=["future_return"])
+# df["target"] = (df["future_return"] > 0.05).astype(int)
+df["target"] = df["future_return"]
 
 
 # EDA
 correlation_report(df, features + ["target"])
-df = df.dropna(subset=["future_return", "target"])
 # La señal lineal es débil.
 # Eso es normal en mercados financieros.
 # Ninguna variable tiene correlación fuerte (> 0.3).
@@ -205,7 +185,7 @@ print(df.head())
 
 # OBJETIVO
 fecha_objetivo = "2001-05-31"
-# fecha_objetivo = "2035-01-31"
+fecha_objetivo = "2035-01-31"
 df = df.loc[:fecha_objetivo].copy()
 
 
@@ -226,79 +206,130 @@ df = df.loc[:fecha_objetivo].copy()
 X = df[features]
 y = df["target"]
 
-aucs = []
-accuracies = []
-last_model = None
-for start in range(min_train_size, len(df) - test_size,6):
 
-    # Definir ventanas
-    X_train = X.iloc[:start]
-    y_train = y.iloc[:start]
+correlations = []
+rank_correlations = []
+r2_scores = []
+mses = []
+
+all_preds = []
+all_actuals = []
+all_dates = []
+
+last_model = None
+
+# Walk-forward validation
+for start in range(min_train_size, len(df) - test_size, 6):
+
+    purge = horizon
+    X_train = X.iloc[:start - purge]
+    y_train = y.iloc[:start - purge]
 
     X_test = X.iloc[start:start + test_size]
     y_test = y.iloc[start:start + test_size]
 
-    # Entrenar modelo nuevo cada vez
-    model = XGBClassifier(
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
+    model = XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=1000,
+        learning_rate=0.03,
+        max_depth=4,
+        min_child_weight=1,
+        gamma=0,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_alpha=0,
+        reg_lambda=1,
         random_state=42,
-        tree_method="hist"
+        tree_method="hist",
+        early_stopping_rounds=100
     )
 
-    model.fit(X_train, y_train)
+    # Validation interna
+    val_size = int(len(X_train) * 0.2)
+
+    X_tr = X_train.iloc[:-val_size]
+    y_tr = y_train.iloc[:-val_size]
+
+    X_val = X_train.iloc[-val_size:]
+    y_val = y_train.iloc[-val_size:]
+
+    model.fit(
+        X_tr,
+        y_tr,
+        eval_set=[(X_val, y_val)],
+        verbose=False
+    )
+
     last_model = model
-    proba = model.predict_proba(X_test)[:, 1]
-    pred = model.predict(X_test)
 
-    # Solo calcular ROC si hay ambas clases
-    if len(np.unique(y_test)) > 1:
-        aucs.append(roc_auc_score(y_test, proba))
+    preds = model.predict(X_test)
 
-    accuracies.append(np.mean(pred == y_test))
+    all_preds.extend(preds)
+    all_actuals.extend(y_test.values)
+    all_dates.extend(y_test.index)
 
-print("Walk-forward Accuracy promedio:", np.mean(accuracies))
-print("Walk-forward ROC AUC promedio:", np.mean(aucs))
+    # Métricas importantes en regresión financiera
+    corr = np.corrcoef(preds, y_test)[0, 1]
+    rank_corr = spearmanr(preds, y_test).correlation
+    r2 = r2_score(y_test, preds)
+    mse = mean_squared_error(y_test, preds)
 
+    correlations.append(corr)
+    rank_correlations.append(rank_corr)
+    r2_scores.append(r2)
+    mses.append(mse)
+
+print("Walk-forward Correlation promedio:", np.nanmean(correlations))
+print("Walk-forward Rank Correlation promedio:", np.nanmean(rank_correlations))
+print("Walk-forward R2 promedio:", np.nanmean(r2_scores))
+print("Walk-forward MSE promedio:", np.nanmean(mses))
 
 print()
-# Última observación disponible
+
 if last_model is not None:
     last_X = X.iloc[[-1]]
-
     walk_pred = last_model.predict(last_X)[0]
-    walk_proba = last_model.predict_proba(last_X)[:, 1][0]
+    print("Predicción retorno 10 meses (walk):", walk_pred)
 
-    print("Predicción último modelo walk:", walk_pred)
-    print("Probabilidad último modelo walk:", walk_proba)
-
-
-
-
-# Predicción final
-final_model = XGBClassifier(
-    n_estimators=100,
-    max_depth=3,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
+final_model= XGBRegressor(
+    objective="reg:squarederror",
+    n_estimators=1000,
+    learning_rate=0.03,
+    max_depth=4,
+    min_child_weight=1,
+    gamma=0,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    reg_alpha=0,
+    reg_lambda=1,
     random_state=42,
-    tree_method="hist"
+    tree_method="hist",
 )
 
 final_model.fit(X, y)
 
-# Tomar última observación
 last_X = X.iloc[[-1]]
-
-# Predicción
 final_pred = final_model.predict(last_X)[0]
-final_proba = final_model.predict_proba(last_X)[:, 1][0]
 
 print()
 print("Última fecha:", X.index[-1])
-print("Predicción clase (sube=1, baja=0):", final_pred)
-print("Probabilidad subida 10 meses:", final_proba)
+print("Predicción retorno 10 meses:", final_pred)
+
+# ── Gráfico Walk-Forward: Predicción vs Real ──
+wf_df = pd.DataFrame({"date": all_dates, "predicted": all_preds, "actual": all_actuals})
+wf_df = wf_df.sort_values("date").drop_duplicates(subset="date", keep="last").reset_index(drop=True)
+
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.plot(wf_df["date"], wf_df["actual"],  label="Retorno real", linewidth=1.2, alpha=0.85)
+ax.plot(wf_df["date"], wf_df["predicted"], label="Predicción", linewidth=1.2, alpha=0.85)
+ax.axhline(0, color="grey", linewidth=0.6, linestyle="--")
+ax.fill_between(wf_df["date"], wf_df["actual"], wf_df["predicted"], alpha=0.15, color="purple")
+ax.set_title(f"Walk-Forward: Retorno {horizon}m — Predicción vs Real", fontsize=13)
+ax.set_ylabel("Retorno")
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.xaxis.set_major_locator(mdates.YearLocator(2))
+fig.autofmt_xdate()
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("walk_forward_predictions.png")
