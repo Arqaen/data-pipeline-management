@@ -9,6 +9,8 @@ venv/
 logs
 tmp
 raw/*.csv
+*.xls
+*.xlsx
 
 # General
 spark-warehouse/
