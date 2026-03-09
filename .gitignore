@@ -11,8 +11,8 @@ tmp
 raw/*.csv
 *.xls
 *.xlsx
-
-# General
+data/*
+metrics/*
 spark-warehouse/
 metastore_db/
 airflow/logs/
@@ -31,3 +31,5 @@ docker/**/logs/
 docker/**/volumes/
 docker/**/.env
 trino/data/
+*.md
+!README.md

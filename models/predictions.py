@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import Dict, List, Optional
-
+import shap
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,7 +19,8 @@ def _has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
     return all(c in df.columns for c in cols)
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parent
+BASE_DIR = BASE / "data"
 HORIZON = 10
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -119,8 +120,9 @@ series_map: Dict[str, pd.DataFrame] = {
     "sp500_pe_ratio": load_series_csv("sp-500-pe-ratio-price-to-earnings-chart.csv", date_col="date").rename(columns={"value": "sp500_pe_ratio"}),
     # "cape_ratio": load_series_csv("Historic-cape-ratios.csv", date_col="Date").rename(columns={"USA": "cape_ratio"}),
     "cape_data": load_series_csv("cape_data.csv", date_col="Date").rename(columns={"CAPE": "cape_data"}),
+    "core_cpi": load_series_csv("CORESTICKM159SFRBATL.csv", date_col="observation_date"),
+    "dxy": load_series_csv("dxy.csv", date_col="Date",drop_columns=["High", "Low", "Open", "Volume"]).rename(columns={"Close": "DXY_Close"}),
 }
-
 
 # PASAR A MENSUAL (último dato del mes)
 sp500 = to_monthly_last(sp500)
@@ -149,26 +151,29 @@ df = sp500.join([
     series_map["sp500_pe_ratio"],
     # series_map["cape_ratio"],
     series_map["cape_data"],
+    series_map["core_cpi"],
+    series_map["dxy"],
 ], how="left")
 
 
 
-print(df)
 
 # FEATURE ENGINEERING 
 
+df = add_technical_indicators(df)
+
 # release lag aproximado
-# df["GDPC1"] = df["GDPC1"].shift(2)
-# df["UNRATE"] = df["UNRATE"].shift(1)
-# df["PERMIT"] = df["PERMIT"].shift(1)
-# df["M2SL"] = df["M2SL"].shift(1)
+df["GDPC1"] = df["GDPC1"].shift(1)
+df["UNRATE"] = df["UNRATE"].shift(1)
+df["PERMIT"] = df["PERMIT"].shift(1)
+df["M2SL"] = df["M2SL"].shift(1)
 
 df["balance_yoy"] = df["WALCL"].pct_change(12)
 df["sp500_12m"] = df["Close"].pct_change(12)
-df["sp500_horizon"] = df["Close"].pct_change(12)
+df["sp500_horizon"] = df["Close"].pct_change(HORIZON)
 df["gdp_yoy"] = df["GDPC1"].pct_change(12)
 df["unemp_change_12m"] = df["UNRATE"].diff(12)
-df["fund_rate_change_3m"] = df["FEDFUNDS"].diff(3)
+df["fund_rate_change_3m"] = df["FEDFUNDS"].diff(12)
 df["vix_level"] = df["VIX_Close"]
 df["vix_3m_change"] = df["VIX_Close"].pct_change(3)
 df["m2_yoy"] = df["M2SL"].pct_change(12)
@@ -177,10 +182,21 @@ df["curve_slope_3m_change"] = df["T10Y3M"].diff(3)
 df["inflation_expectations_3m_change"] = df["T10YIE"].diff(3)
 df["sp500_earnings_yield"] = 1 / df["sp500_pe_ratio"]
 df["cape_earnings_yield"] = 1 / df["cape_data"]
-
-
-
-df = add_technical_indicators(df)
+df["liquidity_impulse"] = df["m2_yoy"] - df["gdp_yoy"]
+df["curve_change_12m"] = df["T10Y3M"].diff(12)
+df["value_momentum"] = df["sp500_earnings_yield"] * df[f"roc_{HORIZON}"]
+df["high_inflation"] = (df["T10YIE"] > 2.5).astype(int)
+df["equity_risk_premium"] = df["sp500_earnings_yield"] - df["DGS10"]
+df["NFCI_3m_change"] = df["NFCI"].diff(3)
+df["drawdown_12m"] = df["Close"] / df["Close"].rolling(12).max() - 1
+df["momentum_12m"] = df["Close"].pct_change(12)
+df["real_rate_change_6m"] = df["DFII10"].diff(6)
+df["dxy_12m"] = df["DXY_Close"].pct_change(12)
+df["dxy_3m_change"] = df["DXY_Close"].pct_change(3)
+df["vix_z_score"] = (df["VIX_Close"] - df["VIX_Close"].rolling(12).mean()) / df["VIX_Close"].rolling(12).std()
+df["earnings_growth_12m"] = df["sp500_pe_ratio"].diff(12) / df["sp500_pe_ratio"].shift(12)
+df["equity_risk_premium"] = df["sp500_earnings_yield"] - df["DGS10"]
+df["hy_spread_change_3m"] = df["BAMLH0A0HYM2"].diff(3)
 
 h = HORIZON
 short = max(3, h // 2)       
@@ -208,6 +224,22 @@ features = [
     "inflation_expectations_3m_change",
     "sp500_earnings_yield",
     "cape_earnings_yield",
+    "liquidity_impulse",
+    "curve_change_12m",
+    "value_momentum",
+    "high_inflation",
+    "CORESTICKM159SFRBATL",
+    "equity_risk_premium",
+    "NFCI_3m_change",
+    "drawdown_12m",
+    "momentum_12m",
+    "real_rate_change_6m",
+    "dxy_12m",
+    "dxy_3m_change",
+    "vix_z_score",
+    "earnings_growth_12m",
+    "hy_spread_change_3m",
+
 
     # ===== TECHNICAL =====
     f"ema_{short}_dist",
@@ -228,7 +260,15 @@ cols_to_drop = [
     "DFII10",
     "ema_5_dist",   
     "ema_10_dist", 
-    "sp500_12m"
+    "sp500_12m",
+    "sp500_horizon",
+    "permit_yoy",
+    "unemp_change_12m",
+    "high_inflation",
+    "rsi_14",
+    "liquidity_impulse",
+    "value_momentum",
+    "momentum_12m"
 ]
 df = df.drop(columns=cols_to_drop, errors="ignore")
 
@@ -239,8 +279,25 @@ features = [f for f in features if f not in cols_to_drop]
 
 
 
+
+
+
+
+# OBJETIVO
+fecha_inicio = "1980-01-31"
+fecha_inicio = "1900-01-31"
+fecha_objetivo = "2001-05-31"
+fecha_objetivo = "2035-01-31"
+df = df.loc[fecha_inicio:fecha_objetivo].copy()
+
+
+
+
+
+
+
 # usar solo variables con 70% historia
-min_history = 0.7   
+min_history = 0.6 
 valid_features = [
     f for f in features
     if df[f].notna().mean() > min_history
@@ -257,11 +314,17 @@ features = valid_features
 
 # TARGET  
 min_train_size = 180   
-test_size = 48     
+test_size = 12 
 
 df["future_return"] = df["Close"].shift(-HORIZON) / df["Close"] - 1
 df = df.dropna(subset=["future_return"])
+
+
+# eliminar overlap
+# df = df.iloc[::HORIZON].copy()
+# clasifación
 # df["target"] = (df["future_return"] > 0.05).astype(int)
+
 df["target"] = df["future_return"]
 df = df.replace([np.inf, -np.inf], np.nan)
 df = df.dropna(subset=["target"])
@@ -269,8 +332,15 @@ df = df.dropna(subset=features)
 
 
 
+
+
+
+
+
+
+
 # EDA
- 
+BASE_DIR = BASE / "metrics"
 correlation_report(df, features + ["target"])
 # La señal lineal es débil.
 # Eso es normal en mercados financieros.
@@ -304,7 +374,7 @@ for col in features:
 # Mide si extremos de la variable predicen retornos distintos
 # Es mucho más útil que mirar solo correlación
 # =========================================================
-feature_to_test = f"roc_{HORIZON}"   # cambia si quieres probar otra
+feature_to_test = f"cape_earnings_yield"   # cambia si quieres probar otra
 df["bin"] = pd.qcut(df[feature_to_test], 10, labels=False, duplicates="drop")
 decile_returns = df.groupby("bin")["target"].mean()
 print("\nRetorno medio por decil:")
@@ -338,7 +408,7 @@ plt.savefig(BASE_DIR / "target_dist.png")
 # =========================================================
 df["decade"] = (df.index.year // 10) * 10
 print("\nCorrelación por década:\n")
-for col in ["sp500_horizon"]:   # puedes probar más features
+for col in ["cape_earnings_yield"]:   # puedes probar más features
     for decade, sub in df.groupby("decade"):
         corr = sub[col].corr(sub["target"])
         print(f"{col} - {decade}s: {corr:.3f}")
@@ -376,12 +446,6 @@ print(df.head())
 
 
 
-# OBJETIVO
-fecha_objetivo = "2001-05-31"
-fecha_objetivo = "2035-01-31"
-df = df.loc[:fecha_objetivo].copy()
-
-
 
 
 
@@ -411,15 +475,21 @@ all_dates = []
 
 last_model = None
 
-# Walk-forward validation
-for start in range(min_train_size, len(df) - test_size, 6):
+# Walk-forward validation con Purging + Embargo
+start = min_train_size
+while start < len(df) - test_size:
 
     purge = HORIZON
-    X_train = X.iloc[:start - purge]
-    y_train = y.iloc[:start - purge]
+    embargo = HORIZON
 
-    X_test = X.iloc[start:start + test_size]
-    y_test = y.iloc[start:start + test_size]
+    train_end = start - purge
+    test_end = start + test_size
+
+    X_train = X.iloc[:train_end]
+    y_train = y.iloc[:train_end]
+
+    X_test = X.iloc[start:test_end]
+    y_test = y.iloc[start:test_end]
 
     model = XGBRegressor(
         objective="reg:squarederror",
@@ -437,8 +507,11 @@ for start in range(min_train_size, len(df) - test_size, 6):
         early_stopping_rounds=100
     )
 
-    # Validation interna
+    # ===== Validation interna temporal =====
     val_size = int(len(X_train) * 0.2)
+
+    if val_size < 1:
+        break
 
     X_tr = X_train.iloc[:-val_size]
     y_tr = y_train.iloc[:-val_size]
@@ -461,16 +534,27 @@ for start in range(min_train_size, len(df) - test_size, 6):
     all_actuals.extend(y_test.values)
     all_dates.extend(y_test.index)
 
-    # Métricas importantes en regresión financiera
-    corr = np.corrcoef(preds, y_test)[0, 1]
-    rank_corr = spearmanr(preds, y_test).correlation
-    r2 = r2_score(y_test, preds)
-    mse = mean_squared_error(y_test, preds)
+    # ===== Métricas =====
+    if len(preds) > 1:
+        corr = pd.Series(preds).corr(pd.Series(y_test.values))
+        rank_corr = spearmanr(preds, y_test.values).correlation
+        r2 = r2_score(y_test.values, preds)
+        mse = mean_squared_error(y_test.values, preds)
+    else:
+        corr = np.nan
+        rank_corr = np.nan
+        r2 = np.nan
+        mse = np.nan
 
     correlations.append(corr)
     rank_correlations.append(rank_corr)
     r2_scores.append(r2)
     mses.append(mse)
+
+    # ===== avanzar con embargo =====
+    start = test_end + embargo
+
+
 
 print("Walk-forward Correlation promedio:", np.nanmean(correlations))
 print("Walk-forward Rank Correlation promedio:", np.nanmean(rank_correlations))
@@ -509,7 +593,7 @@ print("Última fecha:", X.index[-1])
 print("Predicción retorno 10 meses:", final_pred)
 
 # ── Gráfico Walk-Forward: Predicción vs Real ──
-wf_df = pd.DataFrame({"date": all_dates, "predicted": all_preds, "actual": all_actuals})
+wf_df = pd.DataFrame({"date": pd.to_datetime(all_dates), "predicted": all_preds, "actual": all_actuals})
 wf_df = wf_df.sort_values("date").drop_duplicates(subset="date", keep="last").reset_index(drop=True)
 
 fig, ax = plt.subplots(figsize=(14, 5))
@@ -526,3 +610,92 @@ ax.legend()
 ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig(BASE_DIR / "walk_forward_predictions.png")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import shap
+import matplotlib.pyplot as plt
+
+# ==============================
+# SHAP EXPLAINER
+# ==============================
+
+explainer = shap.TreeExplainer(final_model)
+
+# SHAP values para todo el dataset
+shap_values = explainer.shap_values(X)
+
+
+# ==============================
+# SHAP SUMMARY PLOT
+# (features más importantes)
+# ==============================
+
+plt.figure()
+shap.summary_plot(shap_values, X, show=False)
+plt.tight_layout()
+plt.savefig(BASE_DIR / "shap_summary.png")
+
+
+# ==============================
+# SHAP BAR IMPORTANCE
+# (ranking de importancia)
+# ==============================
+
+plt.figure()
+shap.summary_plot(shap_values, X, plot_type="bar", show=False)
+plt.tight_layout()
+plt.savefig(BASE_DIR / "shap_importance_bar.png")
+
+
+# ==============================
+# SHAP DEPENDENCE PLOT
+# (relación feature -> predicción)
+# ==============================
+
+for feature in X.columns:
+    
+    plt.figure()
+    shap.dependence_plot(feature, shap_values, X, show=False)
+    
+    fname = f"shap_dependence_{feature}.png"
+    plt.tight_layout()
+    plt.savefig(BASE_DIR / fname)
+
+
+# ==============================
+# SHAP para la última predicción
+# (explicar por qué predice +15%)
+# ==============================
+
+last_X = X.iloc[[-1]]
+
+shap_values_last = explainer.shap_values(last_X)
+
+plt.figure()
+
+shap.plots.waterfall(
+    shap.Explanation(
+        values=shap_values_last[0],
+        base_values=explainer.expected_value,
+        data=last_X.iloc[0],
+        feature_names=X.columns
+    ),
+    show=False
+)
+
+plt.tight_layout()
+plt.savefig(BASE_DIR / "shap_last_prediction.png")
