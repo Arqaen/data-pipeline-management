@@ -127,6 +127,11 @@ series_map: Dict[str, pd.DataFrame] = {
     "dxy": load_series_csv("dxy.csv", date_col="Date",drop_columns=["High", "Low", "Open", "Volume"]).rename(columns={"Close": "DXY_Close"}),
     "TOTALSA": load_series_csv("TOTALSA.csv", date_col="observation_date"),
     "HOUST": load_series_csv("HOUST.csv", date_col="observation_date"),
+    "TB3MS": load_series_csv("TB3MS.csv", date_col="observation_date"),
+    "DGS3MO": load_series_csv("DGS3MO.csv", date_col="observation_date"),
+    "T10Y2Y": load_series_csv("T10Y2Y.csv", date_col="observation_date"),
+    "USSLIND": load_series_csv("USSLIND.csv", date_col="observation_date"),
+
 }
 
 # PASAR A MENSUAL (último dato del mes)
@@ -160,6 +165,10 @@ df = sp500.join([
     series_map["dxy"],
     series_map["TOTALSA"],
     series_map["HOUST"],
+    series_map["TB3MS"],
+    series_map["DGS3MO"],
+    series_map["T10Y2Y"],
+    series_map["USSLIND"],
 ], how="left")
 
 
@@ -180,6 +189,9 @@ df["TOTALSA"] = df["TOTALSA"].shift(1)
 df["HOUST"] = df["HOUST"].shift(1)
 df["CORESTICKM159SFRBATL"] = df["CORESTICKM159SFRBATL"].shift(1)
 df["WALCL"] = df["WALCL"].shift(1)
+
+
+df["future_return"] = df["Close"].shift(-HORIZON) / df["Close"] - 1
 df["balance_yoy"] = df["WALCL"].pct_change(12)
 df["sp500_12m"] = df["Close"].pct_change(12)
 df["sp500_horizon"] = df["Close"].pct_change(HORIZON)
@@ -215,9 +227,13 @@ df["gdp_yoy_ma6"] = df["gdp_yoy"].rolling(6).mean()
 df["gdp_yoy_diff6"] = df["gdp_yoy"] - df["gdp_yoy"].shift(6)
 df["ret_6m"] = df["Close"].pct_change(6)
 df["ret_12m"] = df["Close"].pct_change(12)
-df["liquidity_trend"] = df["WALCL"].pct_change(6) - df["WALCL"].pct_change(12)
 df["recession"] = (df["UNRATE"] > df["UNRATE"].rolling(24).mean()).astype(int)
+df["liquidity_trend"] = df["WALCL"].pct_change(6) - df["WALCL"].pct_change(12)
 df["liquidity_impulse_lag6"] = df["liquidity_impulse"].shift(6)
+
+df["R_excess"] = df["future_return"] - df["TB3MS"].shift(1) / 100
+df["curve_slope"] = df["DGS10"] - df["T10Y3M"]
+
 
 h = HORIZON
 short = max(3, h // 2)       
@@ -269,6 +285,12 @@ features = [
     "TOTALSA",
     "liquidity_trend",
     "recession",
+    "T10Y2Y",
+
+    # "R_excess",
+    "curve_slope",
+    "USSLIND",
+
     # "gdp_yoy_lag6",
     # "liquidity_impulse_lag6",
     f"ema_{short}_dist",
@@ -375,7 +397,6 @@ features = valid_features
 min_train_size = 180   
 test_size = 12 
 
-df["future_return"] = df["Close"].shift(-HORIZON) / df["Close"] - 1
 df = df.dropna(subset=["future_return"])
 
 
