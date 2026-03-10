@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Dict, List, Optional
 import shap
+import shutil
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,8 +12,10 @@ from xgboost import XGBRegressor
 
 def correlation_report(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     corr = df[cols].corr()
+    # pd.set_option('display.max_colwidth', 5)
+    # pd.set_option('display.max_colwidth', None)
     print("\nCorrelation matrix:")
-    print(corr.round(3))
+    print(corr.round(1))    
     return corr
 
 def _has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
@@ -21,7 +24,7 @@ def _has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
 
 BASE = Path(__file__).resolve().parent
 BASE_DIR = BASE / "data"
-HORIZON = 10
+HORIZON = 16
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -122,6 +125,8 @@ series_map: Dict[str, pd.DataFrame] = {
     "cape_data": load_series_csv("cape_data.csv", date_col="Date").rename(columns={"CAPE": "cape_data"}),
     "core_cpi": load_series_csv("CORESTICKM159SFRBATL.csv", date_col="observation_date"),
     "dxy": load_series_csv("dxy.csv", date_col="Date",drop_columns=["High", "Low", "Open", "Volume"]).rename(columns={"Close": "DXY_Close"}),
+    "TOTALSA": load_series_csv("TOTALSA.csv", date_col="observation_date"),
+    "HOUST": load_series_csv("HOUST.csv", date_col="observation_date"),
 }
 
 # PASAR A MENSUAL (último dato del mes)
@@ -153,10 +158,14 @@ df = sp500.join([
     series_map["cape_data"],
     series_map["core_cpi"],
     series_map["dxy"],
+    series_map["TOTALSA"],
+    series_map["HOUST"],
 ], how="left")
 
 
 
+# DFII10 make dropna
+# df = df.dropna(subset=["DFII10"]).copy()
 
 # FEATURE ENGINEERING 
 
@@ -167,11 +176,15 @@ df["GDPC1"] = df["GDPC1"].shift(1)
 df["UNRATE"] = df["UNRATE"].shift(1)
 df["PERMIT"] = df["PERMIT"].shift(1)
 df["M2SL"] = df["M2SL"].shift(1)
-
+df["TOTALSA"] = df["TOTALSA"].shift(1)
+df["HOUST"] = df["HOUST"].shift(1)
+df["CORESTICKM159SFRBATL"] = df["CORESTICKM159SFRBATL"].shift(1)
+df["WALCL"] = df["WALCL"].shift(1)
 df["balance_yoy"] = df["WALCL"].pct_change(12)
 df["sp500_12m"] = df["Close"].pct_change(12)
 df["sp500_horizon"] = df["Close"].pct_change(HORIZON)
 df["gdp_yoy"] = df["GDPC1"].pct_change(12)
+df["gdp_yoy_lag6"] = df["gdp_yoy"].shift(6)
 df["unemp_change_12m"] = df["UNRATE"].diff(12)
 df["fund_rate_change_3m"] = df["FEDFUNDS"].diff(12)
 df["vix_level"] = df["VIX_Close"]
@@ -195,15 +208,22 @@ df["dxy_12m"] = df["DXY_Close"].pct_change(12)
 df["dxy_3m_change"] = df["DXY_Close"].pct_change(3)
 df["vix_z_score"] = (df["VIX_Close"] - df["VIX_Close"].rolling(12).mean()) / df["VIX_Close"].rolling(12).std()
 df["earnings_growth_12m"] = df["sp500_pe_ratio"].diff(12) / df["sp500_pe_ratio"].shift(12)
-df["equity_risk_premium"] = df["sp500_earnings_yield"] - df["DGS10"]
 df["hy_spread_change_3m"] = df["BAMLH0A0HYM2"].diff(3)
+df["credit_impulse"] = -df["BAMLH0A0HYM2"].diff(12)
+df["real_rate"] = df["DFII10"] - df["CORESTICKM159SFRBATL"]
+df["gdp_yoy_ma6"] = df["gdp_yoy"].rolling(6).mean()
+df["gdp_yoy_diff6"] = df["gdp_yoy"] - df["gdp_yoy"].shift(6)
+df["ret_6m"] = df["Close"].pct_change(6)
+df["ret_12m"] = df["Close"].pct_change(12)
+df["liquidity_trend"] = df["WALCL"].pct_change(6) - df["WALCL"].pct_change(12)
+df["recession"] = (df["UNRATE"] > df["UNRATE"].rolling(24).mean()).astype(int)
+df["liquidity_impulse_lag6"] = df["liquidity_impulse"].shift(6)
 
 h = HORIZON
 short = max(3, h // 2)       
 mid   = h                     
 long  = h * 2                 
 features = [
-    # ===== MACRO =====
     "balance_yoy",
     "sp500_12m",
     "sp500_horizon",
@@ -239,9 +259,18 @@ features = [
     "vix_z_score",
     "earnings_growth_12m",
     "hy_spread_change_3m",
-
-
-    # ===== TECHNICAL =====
+    "credit_impulse",
+    "real_rate",
+    "ret_6m",
+    "ret_12m",
+    "gdp_yoy_diff6",
+    "gdp_yoy_ma6",
+    "HOUST",
+    "TOTALSA",
+    "liquidity_trend",
+    "recession",
+    # "gdp_yoy_lag6",
+    # "liquidity_impulse_lag6",
     f"ema_{short}_dist",
     f"ema_{mid}_dist",
     f"ema_{long}_dist",
@@ -253,28 +282,58 @@ features = [
 
 
 cols_to_drop = [
-    "m2_yoy",
-    "balance_yoy",
+
+    # "m2_yoy",
+    # "balance_yoy",
+    # "permit_yoy",
+    # "unemp_change_12m",
+    # "liquidity_impulse",
+    
+    # MAYBE
+    # "DFII10",
+    # "ema_5_dist",   
+    # "drawdown_12m",
+
+    # TRASH
+    "ema_10_dist", 
+    "ema_20_dist",
     "vix_3m_change",
     "inflation_expectations_3m_change",
-    "DFII10",
-    "ema_5_dist",   
-    "ema_10_dist", 
     "sp500_12m",
     "sp500_horizon",
-    "permit_yoy",
-    "unemp_change_12m",
     "high_inflation",
     "rsi_14",
-    "liquidity_impulse",
     "value_momentum",
-    "momentum_12m"
+    "momentum_12m",
+    "vix_z_score",
+    "dxy_3m_change",
+    "BAMLC0A0CM",
 ]
+
+cols_to_drop = [
+    "sp500_12m",
+    "sp500_horizon",
+    "momentum_12m",
+    "ret_12m",
+    "ema_5_dist",
+    "ema_10_dist",
+    "ema_20_dist",
+    "roc_10",
+    "rsi_14",
+    "value_momentum",
+    "drawdown_12m",
+    "gdp_yoy",
+    "gdp_yoy_ma6"
+]
+# cols_to_drop = []
+
+
+
+
 df = df.drop(columns=cols_to_drop, errors="ignore")
 
-
-
 features = [f for f in features if f not in cols_to_drop]
+print(f"Number of features: {len(features)}")
 
 
 
@@ -284,7 +343,7 @@ features = [f for f in features if f not in cols_to_drop]
 
 
 # OBJETIVO
-fecha_inicio = "1980-01-31"
+fecha_inicio = "1965-01-31"
 fecha_inicio = "1900-01-31"
 fecha_objetivo = "2001-05-31"
 fecha_objetivo = "2035-01-31"
@@ -296,8 +355,8 @@ df = df.loc[fecha_inicio:fecha_objetivo].copy()
 
 
 
-# usar solo variables con 70% historia
-min_history = 0.6 
+# usar solo variables con 60% historia
+min_history = 0.6
 valid_features = [
     f for f in features
     if df[f].notna().mean() > min_history
@@ -328,8 +387,9 @@ df = df.dropna(subset=["future_return"])
 df["target"] = df["future_return"]
 df = df.replace([np.inf, -np.inf], np.nan)
 df = df.dropna(subset=["target"])
+# df[features] = df[features].fillna(0)
+# df[features] = df[features].ffill()
 df = df.dropna(subset=features)
-
 
 
 
@@ -341,12 +401,23 @@ df = df.dropna(subset=features)
 
 # EDA
 BASE_DIR = BASE / "metrics"
+if BASE_DIR.exists():
+    shutil.rmtree(BASE_DIR)
+BASE_DIR.mkdir(exist_ok=True)
+
+
+
 correlation_report(df, features + ["target"])
 # La señal lineal es débil.
 # Eso es normal en mercados financieros.
 # Ninguna variable tiene correlación fuerte (> 0.3).
 # Eso es buena señal:
 # 👉 No hay leakage obvio.
+
+
+
+print(df.head())
+
 
 
 
@@ -440,12 +511,6 @@ print("\nAutocorrelación del target:", round(auto_corr, 3))
 
 
 
-print(df.head())
-# print(df.tail())
-
-
-
-
 
 
 
@@ -485,36 +550,39 @@ while start < len(df) - test_size:
     train_end = start - purge
     test_end = start + test_size
 
-    X_train = X.iloc[:train_end]
-    y_train = y.iloc[:train_end]
+    train_df = df.iloc[:train_end]
+    test_df = df.iloc[start:test_end]
 
-    X_test = X.iloc[start:test_end]
-    y_test = y.iloc[start:test_end]
+    X_train = train_df[features]
+    y_train = train_df["target"]
+
+    X_test = test_df[features]
+    y_test = test_df["target"]
 
     model = XGBRegressor(
         objective="reg:squarederror",
-        n_estimators=1000,
-        learning_rate=0.03,
+        n_estimators=3000,
+        learning_rate=0.01,
         max_depth=4,
         min_child_weight=1,
         gamma=0,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_alpha=0,
-        reg_lambda=1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=3,
         random_state=42,
         tree_method="hist",
-        early_stopping_rounds=100
+        early_stopping_rounds=200
     )
 
     # ===== Validation interna temporal =====
     val_size = int(len(X_train) * 0.2)
+    gap = HORIZON
 
-    if val_size < 1:
-        break
+    train_end = -(val_size + gap)
 
-    X_tr = X_train.iloc[:-val_size]
-    y_tr = y_train.iloc[:-val_size]
+    X_tr = X_train.iloc[:train_end]
+    y_tr = y_train.iloc[:train_end]
 
     X_val = X_train.iloc[-val_size:]
     y_val = y_train.iloc[-val_size:]
@@ -561,36 +629,7 @@ print("Walk-forward Rank Correlation promedio:", np.nanmean(rank_correlations))
 print("Walk-forward R2 promedio:", np.nanmean(r2_scores))
 print("Walk-forward MSE promedio:", np.nanmean(mses))
 
-print()
 
-if last_model is not None:
-    last_X = X.iloc[[-1]]
-    walk_pred = last_model.predict(last_X)[0]
-    print("Predicción retorno 10 meses (walk):", walk_pred)
-
-final_model= XGBRegressor(
-    objective="reg:squarederror",
-    n_estimators=1000,
-    learning_rate=0.03,
-    max_depth=4,
-    min_child_weight=1,
-    gamma=0,
-    subsample=0.9,
-    colsample_bytree=0.9,
-    reg_alpha=0,
-    reg_lambda=1,
-    random_state=42,
-    tree_method="hist",
-)
-
-final_model.fit(X, y)
-
-last_X = X.iloc[[-1]]
-final_pred = final_model.predict(last_X)[0]
-
-print()
-print("Última fecha:", X.index[-1])
-print("Predicción retorno 10 meses:", final_pred)
 
 # ── Gráfico Walk-Forward: Predicción vs Real ──
 wf_df = pd.DataFrame({"date": pd.to_datetime(all_dates), "predicted": all_preds, "actual": all_actuals})
@@ -611,8 +650,35 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig(BASE_DIR / "walk_forward_predictions.png")
 
+print()
 
+if last_model is not None:
+    last_X = X.iloc[[-1]]
+    walk_pred = last_model.predict(last_X)[0]
+    print("Predicción retorno 10 meses (walk):", walk_pred)
 
+final_model= XGBRegressor(
+    objective="reg:squarederror",
+    n_estimators=3000,
+    learning_rate=0.01,
+    max_depth=4,
+    min_child_weight=1,
+    gamma=0,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.1,
+    reg_lambda=3,
+    random_state=42,
+    tree_method="hist",
+)
+
+final_model.fit(X, y)
+
+last_X = X.iloc[[-1]]
+final_pred = final_model.predict(last_X)[0]
+
+print("Última fecha:", X.index[-1])
+print("Predicción retorno 10 meses:", final_pred)
 
 
 

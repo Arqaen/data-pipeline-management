@@ -12,19 +12,19 @@ def get_cape_data():
     df.columns = ["Date", "CAPE"]
     df = df.dropna(subset=["Date"])
     df["Date"] = pd.to_datetime(df["Date"].astype(str), format="%Y.%m") + pd.offsets.MonthEnd(0)
-    df.to_csv("cape_data.csv", index=False)
+    df.to_csv("data/cape_data.csv", index=False)
     print(df)
 
 def get_spy_data():
     df = yf.download("SPY", period="max")
     df.reset_index(inplace=True)
-    df.to_csv("sp500.csv", index=False)
+    df.to_csv("data/sp500.csv", index=False)
     print(df)
 
 def get_dxy_data():
     df = yf.download("DX-Y.NYB", period="max")
     df.reset_index(inplace=True)
-    df.to_csv("dxy.csv", index=False)
+    df.to_csv("data/dxy.csv", index=False)
     print(df)
 
 if __name__ == "__main__":
