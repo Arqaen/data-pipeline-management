@@ -24,7 +24,7 @@ def _has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
 
 BASE = Path(__file__).resolve().parent
 BASE_DIR = BASE / "data"
-HORIZON = 16
+HORIZON = 12
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -131,7 +131,8 @@ series_map: Dict[str, pd.DataFrame] = {
     "DGS3MO": load_series_csv("DGS3MO.csv", date_col="observation_date"),
     "T10Y2Y": load_series_csv("T10Y2Y.csv", date_col="observation_date"),
     "USSLIND": load_series_csv("USSLIND.csv", date_col="observation_date"),
-
+    "BAA": load_series_csv("BAA.csv", date_col="observation_date"),
+    "AAA": load_series_csv("AAA.csv", date_col="observation_date"),
 }
 
 # PASAR A MENSUAL (último dato del mes)
@@ -169,6 +170,8 @@ df = sp500.join([
     series_map["DGS3MO"],
     series_map["T10Y2Y"],
     series_map["USSLIND"],
+    series_map["BAA"],
+    series_map["AAA"],
 ], how="left")
 
 
@@ -181,7 +184,7 @@ df = sp500.join([
 df = add_technical_indicators(df)
 
 # release lag aproximado
-df["GDPC1"] = df["GDPC1"].shift(1)
+df["GDPC1"] = df["GDPC1"].shift(3)
 df["UNRATE"] = df["UNRATE"].shift(1)
 df["PERMIT"] = df["PERMIT"].shift(1)
 df["M2SL"] = df["M2SL"].shift(1)
@@ -191,7 +194,6 @@ df["CORESTICKM159SFRBATL"] = df["CORESTICKM159SFRBATL"].shift(1)
 df["WALCL"] = df["WALCL"].shift(1)
 
 
-df["future_return"] = df["Close"].shift(-HORIZON) / df["Close"] - 1
 df["balance_yoy"] = df["WALCL"].pct_change(12)
 df["sp500_12m"] = df["Close"].pct_change(12)
 df["sp500_horizon"] = df["Close"].pct_change(HORIZON)
@@ -230,20 +232,37 @@ df["ret_12m"] = df["Close"].pct_change(12)
 df["recession"] = (df["UNRATE"] > df["UNRATE"].rolling(24).mean()).astype(int)
 df["liquidity_trend"] = df["WALCL"].pct_change(6) - df["WALCL"].pct_change(12)
 df["liquidity_impulse_lag6"] = df["liquidity_impulse"].shift(6)
-
-df["R_excess"] = df["future_return"] - df["TB3MS"].shift(1) / 100
 df["curve_slope"] = df["DGS10"] - df["T10Y3M"]
-
+df["credit_spread"] = df["BAA"] - df["AAA"]
+df["momentum_change"] = df["momentum_12m"] - df["momentum_12m"].shift(6)
+df["vol_regime"] = df["VIX_Close"] / df["VIX_Close"].rolling(12).mean()
+df["credit_stress"] = df["BAMLH0A0HYM2"].diff(6)
 
 h = HORIZON
 short = max(3, h // 2)       
 mid   = h                     
 long  = h * 2                 
+
+min_features = [
+    "cape_earnings_yield",
+    "equity_risk_premium",
+    "curve_slope",
+    "DFII10",
+    "FEDFUNDS",
+    "credit_spread",
+    "BAMLH0A0HYM2",
+    "CORESTICKM159SFRBATL",
+    "T10YIE",
+    "gdp_yoy",
+    "unemp_change_12m",
+    "permit_yoy",
+    "balance_yoy",
+    "m2_yoy",
+    "NFCI"
+]
+
 features = [
     "balance_yoy",
-    "sp500_12m",
-    "sp500_horizon",
-    "gdp_yoy",
     "unemp_change_12m",
     "fund_rate_change_3m",
     "BAMLC0A0CM",
@@ -262,99 +281,52 @@ features = [
     "cape_earnings_yield",
     "liquidity_impulse",
     "curve_change_12m",
-    "value_momentum",
     "high_inflation",
     "CORESTICKM159SFRBATL",
     "equity_risk_premium",
     "NFCI_3m_change",
-    "drawdown_12m",
-    "momentum_12m",
+    # "momentum_12m",
     "real_rate_change_6m",
     "dxy_12m",
-    "dxy_3m_change",
     "vix_z_score",
     "earnings_growth_12m",
     "hy_spread_change_3m",
     "credit_impulse",
     "real_rate",
-    "ret_6m",
-    "ret_12m",
-    "gdp_yoy_diff6",
-    "gdp_yoy_ma6",
     "HOUST",
     "TOTALSA",
-    "liquidity_trend",
-    "recession",
     "T10Y2Y",
-
-    # "R_excess",
     "curve_slope",
     "USSLIND",
+    "credit_spread",
 
-    # "gdp_yoy_lag6",
+
+    # "gdp_yoy_ma6",
     # "liquidity_impulse_lag6",
-    f"ema_{short}_dist",
-    f"ema_{mid}_dist",
-    f"ema_{long}_dist",
-    "rsi_14",
-    f"roc_{HORIZON}",
-]
-
-
-
-
-cols_to_drop = [
-
-    # "m2_yoy",
-    # "balance_yoy",
-    # "permit_yoy",
-    # "unemp_change_12m",
-    # "liquidity_impulse",
-    
-    # MAYBE
-    # "DFII10",
-    # "ema_5_dist",   
+    # "value_momentum",
+    # "ret_6m",
+    # "momentum_change",
+    "vol_regime",
+    "credit_stress",    
+    "recession",
+    "liquidity_trend",
+    "gdp_yoy_lag6",
+    # "gdp_yoy",
+    # "gdp_yoy_diff6",
+    # "dxy_3m_change",
     # "drawdown_12m",
-
-    # TRASH
-    "ema_10_dist", 
-    "ema_20_dist",
-    "vix_3m_change",
-    "inflation_expectations_3m_change",
-    "sp500_12m",
-    "sp500_horizon",
-    "high_inflation",
-    "rsi_14",
-    "value_momentum",
-    "momentum_12m",
-    "vix_z_score",
-    "dxy_3m_change",
-    "BAMLC0A0CM",
+    # "sp500_12m",
+    # "sp500_horizon",
+    # "ret_12m",
+    # f"ema_{short}_dist",
+    # f"ema_{mid}_dist",
+    # f"ema_{long}_dist",
+    # "rsi_14",
+    # f"roc_{HORIZON}",
 ]
 
-cols_to_drop = [
-    "sp500_12m",
-    "sp500_horizon",
-    "momentum_12m",
-    "ret_12m",
-    "ema_5_dist",
-    "ema_10_dist",
-    "ema_20_dist",
-    "roc_10",
-    "rsi_14",
-    "value_momentum",
-    "drawdown_12m",
-    "gdp_yoy",
-    "gdp_yoy_ma6"
-]
-# cols_to_drop = []
 
-
-
-
-df = df.drop(columns=cols_to_drop, errors="ignore")
-
-features = [f for f in features if f not in cols_to_drop]
+# features = min_features
 print(f"Number of features: {len(features)}")
 
 
@@ -397,15 +369,19 @@ features = valid_features
 min_train_size = 180   
 test_size = 12 
 
-df = df.dropna(subset=["future_return"])
-
 
 # eliminar overlap
 # df = df.iloc[::HORIZON].copy()
 # clasifación
 # df["target"] = (df["future_return"] > 0.05).astype(int)
+df["future_return"] = df["Close"].shift(-HORIZON) / df["Close"] - 1
+# ===============================
+# Target: cambio de tendencia
+# ===============================
+ret_fut = np.log(df["Close"]).diff(HORIZON).shift(-HORIZON)
+ret_past = np.log(df["Close"]).diff(HORIZON)
+df["target"] = ret_fut - ret_past
 
-df["target"] = df["future_return"]
 df = df.replace([np.inf, -np.inf], np.nan)
 df = df.dropna(subset=["target"])
 # df[features] = df[features].fillna(0)
@@ -512,7 +488,7 @@ for col in ["cape_earnings_yield"]:   # puedes probar más features
 
 # =========================================================
 # 5️⃣ Autocorrelación del Target
-# Mide si el retorno a 10 meses tiene memoria propia
+# Mide si el retorno ene memoria propia
 # =========================================================
 auto_corr = df["target"].autocorr()
 print("\nAutocorrelación del target:", round(auto_corr, 3))
@@ -641,6 +617,7 @@ while start < len(df) - test_size:
     mses.append(mse)
 
     # ===== avanzar con embargo =====
+    # start += test_size
     start = test_end + embargo
 
 
@@ -653,16 +630,38 @@ print("Walk-forward MSE promedio:", np.nanmean(mses))
 
 
 # ── Gráfico Walk-Forward: Predicción vs Real ──
-wf_df = pd.DataFrame({"date": pd.to_datetime(all_dates), "predicted": all_preds, "actual": all_actuals})
-wf_df = wf_df.sort_values("date").drop_duplicates(subset="date", keep="last").reset_index(drop=True)
-
-fig, ax = plt.subplots(figsize=(14, 5))
-ax.plot(wf_df["date"], wf_df["actual"],  label="Retorno real", linewidth=1.2, alpha=0.85)
-ax.plot(wf_df["date"], wf_df["predicted"], label="Predicción", linewidth=1.2, alpha=0.85)
+wf_df = pd.DataFrame({
+    "date": pd.to_datetime(all_dates),
+    "predicted": all_preds,
+    "actual": all_actuals
+})
+wf_df = (
+    wf_df.sort_values("date")
+    .drop_duplicates(subset="date", keep="last")
+    .reset_index(drop=True)
+)
+wf_df["signal_raw"] = wf_df["predicted"]
+wf_df["signal"] = wf_df["predicted"].rolling(3).mean()
+fig, ax = plt.subplots(figsize=(14,5))
+ax.plot(wf_df["date"], wf_df["actual"], 
+        label="Cambio tendencia real", 
+        color="black", alpha=0.7)
+ax.plot(wf_df["date"], wf_df["signal_raw"], 
+        label="Predicción modelo", 
+        color="purple", alpha=0.3)
+ax.plot(wf_df["date"], wf_df["signal"], 
+        label="Señal suavizada (3)", 
+        color="purple", linewidth=2)
 ax.axhline(0, color="grey", linewidth=0.6, linestyle="--")
-ax.fill_between(wf_df["date"], wf_df["actual"], wf_df["predicted"], alpha=0.15, color="purple")
-ax.set_title(f"Walk-Forward: Retorno {HORIZON}m — Predicción vs Real", fontsize=13)
-ax.set_ylabel("Retorno")
+ax.fill_between(
+    wf_df["date"],
+    wf_df["actual"],
+    wf_df["signal"],
+    alpha=0.12,
+    color="purple"
+)
+ax.set_title(f"Walk-Forward — Cambio de tendencia {HORIZON}m")
+ax.set_ylabel("Cambio de tendencia")
 ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 ax.xaxis.set_major_locator(mdates.YearLocator(2))
 fig.autofmt_xdate()
@@ -671,12 +670,126 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig(BASE_DIR / "walk_forward_predictions.png")
 
+
+
+
+# ── Gráfico Precio vs Señal de Tendencia ──
+fig, ax1 = plt.subplots(figsize=(14,5))
+ax1.plot(df.index, df["Close"], color="black", label="S&P500")
+ax1.set_yscale("log")
+ax1.set_ylabel("Precio")
+ax2 = ax1.twinx()
+signal = wf_df.set_index("date")["signal"]
+ax2.plot(signal.index, signal, color="purple", label="Señal modelo")
+ax2.fill_between(
+    signal.index,
+    0,
+    signal,
+    where=signal > 0,
+    color="green",
+    alpha=0.15
+)
+ax2.fill_between(
+    signal.index,
+    0,
+    signal,
+    where=signal < 0,
+    color="red",
+    alpha=0.15
+)
+ax2.axhline(0, linestyle="--", color="grey")
+ax1.set_title("Precio vs señal de cambio de tendencia")
+fig.tight_layout()
+fig.savefig(BASE_DIR / "price_vs_signal.png")
+
+
+
+# ── Scatter Plot ──
+fig, ax = plt.subplots(figsize=(6,6))
+ax.scatter(wf_df["predicted"], wf_df["actual"], alpha=0.4)
+ax.axhline(0,color="grey")
+ax.axvline(0,color="grey")
+ax.set_xlabel("Predicción")
+ax.set_ylabel("Target real")
+ax.set_title("Predicción vs cambio de tendencia real")
+plt.tight_layout()
+plt.savefig(BASE_DIR / "prediction_scatter.png")
+
+
+
+
+# ── Ranking power ──
+dec_df = wf_df.copy()
+dec_df["decile"] = pd.qcut(dec_df["predicted"], 10, labels=False)
+deciles = dec_df.groupby("decile")["actual"].mean()
+fig, ax = plt.subplots(figsize=(8,4))
+deciles.plot(kind="bar", ax=ax)
+ax.set_title("Cambio de tendencia medio por decil de predicción")
+ax.set_xlabel("Decil predicción (bajo → alto)")
+ax.set_ylabel("Target medio")
+plt.tight_layout()
+plt.savefig(BASE_DIR / "decile_plot.png")
+
+
+
+# ── Rolling information coef ──
+rolling_ic = (
+    wf_df["predicted"]
+    .rolling(60)
+    .corr(wf_df["actual"])
+)
+fig, ax = plt.subplots(figsize=(14,4))
+ax.plot(wf_df["date"], rolling_ic, color="purple")
+ax.axhline(0, linestyle="--", color="grey")
+ax.set_title("Rolling Information Coefficient (60)")
+ax.set_ylabel("IC")
+plt.tight_layout()
+plt.savefig(BASE_DIR / "rolling_ic.png")
+
+
+
+
+
+
+
+# ── Strategy ──
+future_return = np.log(df["Close"]).diff(HORIZON).shift(-HORIZON)
+ret_past = np.log(df["Close"]).diff(HORIZON)
+strat_df = wf_df.copy()
+strat_df["future_return"] = future_return.loc[strat_df["date"]].values
+strat_df["ret_past"] = ret_past.loc[strat_df["date"]].values
+# reconstruir retorno esperado
+strat_df["ret_future_pred"] = strat_df["predicted"] + strat_df["ret_past"]
+# posición proporcional
+strat_df["position"] = strat_df["ret_future_pred"]
+strat_df["position"] /= strat_df["position"].abs().mean()
+# retorno estrategia (ajustado horizonte)
+strat_df["strategy"] = strat_df["position"] * strat_df["future_return"] / HORIZON
+equity = (1 + strat_df["strategy"]).cumprod()
+equity = (1 + strat_df["strategy"]).cumprod()
+fig, ax = plt.subplots(figsize=(14,5))
+ax.plot(strat_df["date"], equity, label="Estrategia modelo")
+ax.set_title("Equity curve estrategia simple")
+ax.set_yscale("log")
+ax.legend()
+plt.tight_layout()
+plt.savefig(BASE_DIR / "strategy_equity.png")
+
+benchmark = (1 + strat_df["future_return"] / HORIZON).cumprod()
+ax.plot(strat_df["date"], benchmark, label="Buy & Hold", alpha=0.7)
+plt.tight_layout()
+plt.savefig(BASE_DIR / "benchmark.png")
+
+
+
+
+
 print()
 
 if last_model is not None:
     last_X = X.iloc[[-1]]
     walk_pred = last_model.predict(last_X)[0]
-    print("Predicción retorno 10 meses (walk):", walk_pred)
+    print(f"Predicción retorno {HORIZON} meses (walk):", walk_pred)
 
 final_model= XGBRegressor(
     objective="reg:squarederror",
@@ -699,7 +812,7 @@ last_X = X.iloc[[-1]]
 final_pred = final_model.predict(last_X)[0]
 
 print("Última fecha:", X.index[-1])
-print("Predicción retorno 10 meses:", final_pred)
+print(f"Predicción retorno {HORIZON} meses:", final_pred)
 
 
 
