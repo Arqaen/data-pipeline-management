@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import shutil
 import matplotlib.dates as mdates
 import shap 
@@ -20,6 +20,81 @@ from sklearn.metrics import (
     confusion_matrix,
     classification_report,
 )
+
+
+def _sample_param_combo(param_dist: Dict[str, List], rng: np.random.RandomState) -> Dict:
+    return {key: rng.choice(values) for key, values in param_dist.items()}
+
+
+def tune_xgb_random_search_timeval(
+    X_tr: pd.DataFrame,
+    y_tr: pd.Series,
+    X_es: pd.DataFrame,
+    y_es: pd.Series,
+    X_score: pd.DataFrame,
+    y_score: pd.Series,
+    *,
+    fixed_params: Dict,
+    param_dist: Dict[str, List],
+    n_iter: int = 30,
+    random_state: int = 42,
+    scale_pos_weight: float = 1.0,
+) -> Tuple[Dict, int, float]:
+    """Random search con validación temporal (X_tr -> early-stopping -> scoring).
+
+    - Sin RandomizedSearchCV (que no encaja bien con early_stopping + embargo).
+    - Score: maximiza ROC-AUC en el bloque de scoring.
+
+    Devuelve: (best_params, best_n_estimators, best_roc_auc)
+    """
+    rng = np.random.RandomState(random_state)
+
+    best_params: Dict = {}
+    best_score = -np.inf
+    best_n_estimators = int(fixed_params.get("n_estimators", 5000))
+
+    # Si no hay suficientes clases, log_loss sigue siendo válido con labels=[0,1]
+    # pero el tuning puede ser poco informativo. Aun así, lo dejamos correr.
+    for _ in range(int(n_iter)):
+        params = _sample_param_combo(param_dist, rng)
+        model = XGBClassifier(
+            **fixed_params,
+            **params,
+            scale_pos_weight=scale_pos_weight,
+        )
+        model.fit(
+            X_tr,
+            y_tr,
+            eval_set=[(X_es, y_es)],
+            verbose=False,
+        )
+        score_proba = model.predict_proba(X_score)[:, 1]
+
+        if len(np.unique(y_score)) > 1:
+            score = float(roc_auc_score(y_score, score_proba))
+        else:
+            # ROC-AUC no definido con una sola clase; fallback a -logloss para poder comparar.
+            score = -float(log_loss(y_score, score_proba, labels=[0, 1]))
+
+        # best_iteration está disponible cuando hay early_stopping
+        bi = getattr(model, "best_iteration", None)
+        if bi is not None:
+            n_estimators = int(bi) + 1
+        else:
+            n_estimators = int(fixed_params.get("n_estimators", 5000))
+
+        if score > best_score:
+            best_score = score
+            best_params = params
+
+            # Guardar también el tamaño efectivo del modelo
+            best_n_estimators = n_estimators
+
+    print(
+        f"[RandomSearch] best ROC-AUC(score)={best_score:.5f} "
+        f"best_n_estimators={best_n_estimators} params={best_params}"
+    )
+    return best_params, best_n_estimators, float(best_score)
 
 
 
@@ -529,6 +604,29 @@ y = df["target"].astype(int)
 base_rate = float(y.mean())
 print(f"Target base-rate (P(y=1)) en dataset: {base_rate:.3f}")
 
+# =============================
+# Random Search (hiperparámetros)
+# =============================
+DO_RANDOM_SEARCH = True
+TUNE_EACH_FOLD = False  # True = tunear en cada ventana; False = tunear 1 vez y reutilizar
+RANDOM_SEARCH_N_ITER = 500
+RANDOM_SEARCH_SEED = 42
+SCORE_FRAC = 0.5  # fracción del bloque de validación reservada para scoring (ROC-AUC) + umbral
+
+param_dist = {
+    "learning_rate": [0.005, 0.01, 0.02, 0.05],
+    "max_depth": [3, 4, 5, 6],
+    "min_child_weight": [1, 3, 5, 8, 12],
+    "gamma": [0, 0.5, 1, 2, 5],
+    "subsample": [0.6, 0.7, 0.8, 0.9],
+    # "colsample_bytree": [0.6, 0.7, 0.8, 0.9],
+    "reg_lambda": [3, 5, 10, 15, 20],
+    # "reg_alpha": [0, 0.1, 0.5, 1],
+}
+
+best_params_global: Optional[Dict] = None
+best_n_estimators_global: Optional[int] = None
+
 # --- Walk-forward metrics ---
 accs = []
 aucs = []
@@ -575,24 +673,6 @@ while start < len(df) - test_size:
     neg = int((y_train == 0).sum())
     scale_pos_weight = (neg / pos) if (pos > 0 and pos < neg) else 1.0
 
-    model = XGBClassifier(
-        objective="binary:logistic",
-        n_estimators=5000,
-        learning_rate=0.01,
-        max_depth=4,
-        min_child_weight=1,
-        gamma=0,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=3,
-        random_state=42,
-        tree_method="hist",
-        eval_metric="logloss",
-        early_stopping_rounds=200,
-        scale_pos_weight=scale_pos_weight,
-    )
-
     # ===== Validation interna temporal =====
     val_size = int(len(X_train) * 0.2)
     gap = HORIZON
@@ -604,11 +684,79 @@ while start < len(df) - test_size:
     X_val = X_train.iloc[-val_size:]
     y_val = y_train.iloc[-val_size:]
 
+    # Separar bloque de validación: early-stopping (pasado) vs scoring (más reciente)
+    if len(X_val) < 3:
+        X_es = X_val
+        y_es = y_val
+        X_score = X_val
+        y_score = y_val
+    else:
+        score_size = max(1, int(len(X_val) * SCORE_FRAC))
+        es_size = len(X_val) - score_size
+        if es_size < 1:
+            es_size = 1
+            score_size = len(X_val) - 1
+
+        X_es = X_val.iloc[:es_size]
+        y_es = y_val.iloc[:es_size]
+        X_score = X_val.iloc[es_size:]
+        y_score = y_val.iloc[es_size:]
+
+    # ===== Random Search (opcional) =====
+    fixed_params = dict(
+        objective="binary:logistic",
+        n_estimators=5000,
+        random_state=42,
+        tree_method="hist",
+        eval_metric="auc",
+        early_stopping_rounds=200,
+    )
+
+    if DO_RANDOM_SEARCH and (TUNE_EACH_FOLD or best_params_global is None):
+        # Nota: el tuning usa solo (X_tr -> X_val). No toca el test.
+        best_params, best_n_estimators, _best_val_score = tune_xgb_random_search_timeval(
+            X_tr,
+            y_tr,
+            X_es,
+            y_es,
+            X_score,
+            y_score,
+            fixed_params=fixed_params,
+            param_dist=param_dist,
+            n_iter=RANDOM_SEARCH_N_ITER,
+            random_state=RANDOM_SEARCH_SEED,
+            scale_pos_weight=scale_pos_weight,
+        )
+        if not TUNE_EACH_FOLD:
+            best_params_global = best_params
+            best_n_estimators_global = best_n_estimators
+    else:
+        best_params = best_params_global or {}
+        best_n_estimators = best_n_estimators_global
+
+    # Aplicar best_n_estimators si lo tenemos; si no, usar el máximo (early stopping recorta)
+    if best_n_estimators is None:
+        best_n_estimators = int(fixed_params.get("n_estimators", 5000))
+
+    print(
+        f"[Fold] usando best_params={best_params} "
+        f"best_n_estimators={int(best_n_estimators)} scale_pos_weight={scale_pos_weight:.3f}"
+    )
+
+    fold_fixed_params = dict(fixed_params)
+    fold_fixed_params["n_estimators"] = int(best_n_estimators)
+
+    model = XGBClassifier(
+        **fold_fixed_params,
+        **best_params,
+        scale_pos_weight=scale_pos_weight,
+    )
+
     model.fit(
         X_tr,
         y_tr,
-        eval_set=[(X_val, y_val)],
-        verbose=False
+        eval_set=[(X_es, y_es)],
+        verbose=False,
     )
 
     last_model = model
@@ -618,14 +766,14 @@ while start < len(df) - test_size:
 
     # ===== Selección de umbral (en validación temporal) =====
     # Nota: 0.5 rara vez es óptimo si la base-rate != 0.5.
-    val_proba = model.predict_proba(X_val)[:, 1]
+    val_proba = model.predict_proba(X_score)[:, 1]
     thresholds = np.linspace(0.05, 0.95, 91)
     best_thr = 0.5
     best_score = -np.inf
-    if len(np.unique(y_val)) > 1:
+    if len(np.unique(y_score)) > 1:
         for thr in thresholds:
             vpred = (val_proba >= thr).astype(int)
-            score = balanced_accuracy_score(y_val, vpred)
+            score = balanced_accuracy_score(y_score, vpred)
             if score > best_score:
                 best_score = score
                 best_thr = float(thr)
