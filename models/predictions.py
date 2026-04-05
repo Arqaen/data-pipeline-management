@@ -7,7 +7,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
+from sklearn.calibration import calibration_curve
 from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import precision_recall_curve, roc_curve
 from xgboost import XGBRegressor
 from xgboost import XGBClassifier
 from sklearn.metrics import (
@@ -116,11 +118,157 @@ def simulate_monthly_dca_roi(
 
 def correlation_report(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     corr = df[cols].corr()
-    # pd.set_option('display.max_colwidth', 5)
-    # pd.set_option('display.max_colwidth', None)
-    print("\nCorrelation matrix:")
-    print(corr.round(1))    
     return corr
+
+
+def _save_table_figure(
+    table_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    footer: Optional[str] = None,
+    float_fmt: str = "{:.4f}",
+) -> None:
+    """Guarda un DataFrame como tabla (matplotlib) en un PNG."""
+    if table_df is None or table_df.empty:
+        return
+
+    disp = table_df.copy()
+    for col in disp.columns:
+        if pd.api.types.is_numeric_dtype(disp[col]):
+            disp[col] = disp[col].map(lambda x: "" if pd.isna(x) else float_fmt.format(float(x)))
+        else:
+            disp[col] = disp[col].astype(str)
+
+    n_rows, n_cols = disp.shape
+    fig_w = max(7.5, 1.25 * (n_cols + 1))
+    fig_h = max(2.2, 0.45 * (n_rows + 2))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+
+    tbl = ax.table(
+        cellText=disp.values,
+        colLabels=[str(c) for c in disp.columns],
+        rowLabels=[str(i) for i in disp.index],
+        loc="center",
+        cellLoc="center",
+        rowLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1.0, 1.3)
+
+    fig.suptitle(title, y=0.97)
+    if footer:
+        fig.text(0.01, 0.02, footer, ha="left", va="bottom", fontsize=9)
+
+    fig.tight_layout(rect=[0, 0.04 if footer else 0, 1, 0.95])
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_correlation_heatmap(
+    corr: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    target_col: str = "target",
+    max_vars: int = 25,
+    top_k: int = 20,
+) -> None:
+    """Heatmap de correlación; si hay muchas variables, usa top-k vs target."""
+    if corr is None or corr.empty:
+        return
+
+    corr_plot = corr.copy()
+    if corr_plot.shape[0] > max_vars:
+        if target_col in corr_plot.columns:
+            ranked = (
+                corr_plot[target_col]
+                .drop(labels=[target_col], errors="ignore")
+                .abs()
+                .sort_values(ascending=False)
+            )
+            keep = list(ranked.head(int(top_k)).index)
+            keep = keep + [target_col]
+            corr_plot = corr_plot.loc[keep, keep]
+            title = f"{title} (top {top_k} vs {target_col})"
+        else:
+            corr_plot = corr_plot.iloc[:max_vars, :max_vars]
+            title = f"{title} (primeras {max_vars})"
+
+    labels = [str(c) for c in corr_plot.columns]
+    fig_w = max(8.0, 0.35 * len(labels))
+    fig_h = max(7.0, 0.35 * len(labels))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    data = corr_plot.to_numpy(dtype=float)
+    im = ax.imshow(data, cmap="coolwarm", vmin=-1.0, vmax=1.0)
+
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=90)
+    ax.set_yticklabels(labels)
+    ax.set_title(title)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Correlación")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def compute_spearman_rank_corr(
+    df: pd.DataFrame,
+    features: List[str],
+    *,
+    target_col: str = "target",
+) -> pd.Series:
+    """Spearman feature vs target con dropna por pares."""
+    values: Dict[str, float] = {}
+    for col in features:
+        if col not in df.columns or target_col not in df.columns:
+            continue
+        pair = df[[col, target_col]].dropna()
+        if len(pair) < 3:
+            values[col] = np.nan
+            continue
+        values[col] = float(spearmanr(pair[col], pair[target_col]).correlation)
+    return pd.Series(values, dtype=float)
+
+
+def plot_spearman_rank_corr_bar(
+    spearman_corr: pd.Series,
+    *,
+    out_path: Path,
+    title: str,
+    top_n: Optional[int] = None,
+) -> None:
+    if spearman_corr is None or spearman_corr.empty:
+        return
+
+    s = spearman_corr.dropna().copy()
+    if s.empty:
+        return
+
+    # Orden por |corr| para lectura rápida.
+    s = s.reindex(s.abs().sort_values(ascending=False).index)
+    if top_n is not None:
+        s = s.head(int(top_n))
+
+    s = s.sort_values()  # para que el barh quede de menor a mayor
+
+    fig_h = max(6.0, 0.22 * len(s) + 1.5)
+    fig, ax = plt.subplots(figsize=(10.5, fig_h))
+    ax.barh(s.index.astype(str), s.values, color="tab:blue", alpha=0.85)
+    ax.axvline(0, color="grey", lw=1, alpha=0.7)
+    ax.set_title(title)
+    ax.set_xlabel("Spearman ρ")
+    ax.grid(True, axis="x", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 def _has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
     return all(c in df.columns for c in cols)
@@ -139,6 +287,8 @@ def plot_classification_timeline(
     price_col: str = "close_t",
     price_fwd_col: str = "close_t_plus_h",
 ) -> None:
+    from matplotlib.patches import Patch
+
     dfp = plot_df.copy()
     dfp[date_col] = pd.to_datetime(dfp[date_col])
     dfp = dfp.sort_values(date_col).reset_index(drop=True)
@@ -166,9 +316,9 @@ def plot_classification_timeline(
 
     colors = {
         0: ("TN", "tab:blue"),
-        1: ("FP", "tab:red"),
-        2: ("FN", "tab:orange"),
-        3: ("TP", "tab:green"),
+        1: ("TP", "tab:green"),
+        2: ("FP", "tab:red"),
+        3: ("FN", "tab:orange"),
     }
 
     acc = float(accuracy_score(y_true, y_pred))
@@ -185,7 +335,6 @@ def plot_classification_timeline(
     for i in range(len(dfp)):
         _, col = colors[int(outcome[i])]
         ax0.axvspan(dfp.loc[i, date_col], ends.iloc[i], color=col, alpha=0.10, lw=0)
-        ax1.axvspan(dfp.loc[i, date_col], ends.iloc[i], color=col, alpha=0.10, lw=0)
 
     # ax0.plot(
     #     dfp[date_col],
@@ -197,15 +346,17 @@ def plot_classification_timeline(
     #     drawstyle="steps-post",
     #     zorder=3,
     # )
-    ax0.plot(
+
+    # Predicción como puntos (evita estética de función escalón)
+    ax0.scatter(
         dfp[date_col],
         dfp[pred_col],
         label="Predicción de clase (0/1)",
         color="tab:orange",
         alpha=0.85,
-        lw=1.6,
-        drawstyle="steps-post",
-        zorder=3,
+        s=18,
+        edgecolor="none",
+        zorder=4,
     )
     ax0.set_ylim(-0.05, 1.05)
     ax0.set_ylabel("Clase")
@@ -229,13 +380,25 @@ def plot_classification_timeline(
     #         alpha=0.20,
     #         lw=1.0,
     #         linestyle="--",
-    # )
+    #     )
     ax0b.set_ylabel("Precio (Close)")
     ax0b.set_yscale("log")
 
+    # Leyenda: incluye el mapa de colores TN/FP/FN/TP (para el fondo)
+    outcome_handles = [
+        Patch(facecolor=col, edgecolor="none", alpha=0.25, label=lab)
+        for _, (lab, col) in colors.items()
+    ]
+
     lines0, labels0 = ax0.get_legend_handles_labels()
     lines0b, labels0b = ax0b.get_legend_handles_labels()
-    ax0.legend(lines0 + lines0b, labels0 + labels0b, loc="upper left")
+    ax0.legend(
+        lines0 + lines0b + outcome_handles,
+        labels0 + labels0b + [h.get_label() for h in outcome_handles],
+        loc="upper left",
+        ncol=2,
+        fontsize=9,
+    )
 
     if proba_col in dfp.columns:
         ax1.plot(
@@ -247,23 +410,6 @@ def plot_classification_timeline(
             label="P(sube)",
         )
 
-        # shown = set()
-        # for code, (lab, col) in colors.items():
-            # mask = outcome == code
-            # if not mask.any():
-            #     continue
-            # ax1.scatter(
-            #     dfp.loc[mask, date_col],
-            #     dfp.loc[mask, proba_col],
-            #     s=14,
-            #     color=col,
-            #     alpha=0.80,
-            #     edgecolor="none",
-            #     label=lab if lab not in shown else None,
-            #     zorder=4,
-            # )
-            # shown.add(lab)
-
         ax1.axhline(
             float(threshold),
             color="grey",
@@ -274,7 +420,7 @@ def plot_classification_timeline(
         )
         ax1.set_ylim(0.0, 1.0)
         ax1.set_ylabel("Prob.")
-        ax1.legend(loc="upper left", ncol=3, fontsize=9)
+        ax1.legend(loc="upper left", ncol=2, fontsize=9)
 
     ax1.set_xlabel("Fecha")
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -284,6 +430,483 @@ def plot_classification_timeline(
     ax1.grid(True, alpha=0.25)
 
     fig.suptitle(f"{title}\nAcc={acc:.3f} | BalAcc={bal_acc:.3f}", y=0.98)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_confusion_matrix_wf(
+    y_true: pd.Series,
+    y_pred: pd.Series,
+    *,
+    out_path: Path,
+    title: str,
+    class_labels: Tuple[str, str] = ("0", "1"),
+) -> None:
+    cm = confusion_matrix(y_true.astype(int), y_pred.astype(int), labels=[0, 1])
+    if cm.shape != (2, 2):
+        raise ValueError(f"Confusion matrix inesperada: shape={cm.shape}")
+
+    cm = cm.astype(float)
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm, row_sums, out=np.zeros_like(cm), where=row_sums != 0)
+
+    outcome = np.array([["TN", "FP"], ["FN", "TP"]], dtype=object)
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.4))
+    im = ax.imshow(cm_norm, cmap="Blues", vmin=0.0, vmax=1.0)
+
+    ax.set_title(title)
+    ax.set_xlabel("Predicho")
+    ax.set_ylabel("Real")
+    ax.set_xticks([0, 1], labels=list(class_labels))
+    ax.set_yticks([0, 1], labels=list(class_labels))
+
+    for i in range(2):
+        for j in range(2):
+            count = int(cm[i, j])
+            pct = float(cm_norm[i, j]) * 100.0
+            ax.text(
+                j,
+                i,
+                f"{outcome[i, j]}\n{count:d}\n{pct:.1f}%",
+                ha="center",
+                va="center",
+                fontsize=11,
+                color="black" if cm_norm[i, j] < 0.65 else "white",
+            )
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("% dentro de la clase real (normalizado por fila)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_calibration_curve_wf(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    n_bins: int = 10,
+    actual_col: str = "actual",
+    proba_col: str = "proba_up",
+) -> None:
+    dfp = wf_df[[actual_col, proba_col]].copy()
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return
+
+    y_true = dfp[actual_col].astype(int).to_numpy()
+    y_proba = dfp[proba_col].astype(float).to_numpy()
+    y_proba = np.clip(y_proba, 0.0, 1.0)
+
+    fig, ax = plt.subplots(figsize=(6.8, 5.2))
+
+    if len(np.unique(y_true)) < 2:
+        ax.text(
+            0.5,
+            0.5,
+            "Calibration curve no definida\n(solo 1 clase en WF)",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+    else:
+        frac_pos, mean_pred = calibration_curve(
+            y_true,
+            y_proba,
+            n_bins=int(n_bins),
+            strategy="quantile",
+        )
+        ax.plot(mean_pred, frac_pos, marker="o", lw=1.8, label="Modelo")
+        ax.plot([0, 1], [0, 1], linestyle="--", color="grey", lw=1.2, label="Ideal")
+
+    ax.set_title(title)
+    ax.set_xlabel("Probabilidad predicha")
+    ax.set_ylabel("Frecuencia real de clase=1")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_proba_hist_by_class(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    actual_col: str = "actual",
+    proba_col: str = "proba_up",
+    bins: int = 25,
+    kde: bool = True,
+) -> None:
+    from scipy.stats import gaussian_kde
+
+    dfp = wf_df[[actual_col, proba_col]].copy()
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return
+
+    y_true = dfp[actual_col].astype(int)
+    y_proba = np.clip(dfp[proba_col].astype(float).to_numpy(), 0.0, 1.0)
+
+    p0 = y_proba[(y_true == 0).to_numpy()]
+    p1 = y_proba[(y_true == 1).to_numpy()]
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.8))
+    ax.hist(p0, bins=bins, density=True, alpha=0.45, color="tab:blue", label="Real=0")
+    ax.hist(p1, bins=bins, density=True, alpha=0.45, color="tab:orange", label="Real=1")
+
+    if kde:
+        grid = np.linspace(0.0, 1.0, 300)
+        if len(p0) > 3 and np.std(p0) > 1e-12:
+            ax.plot(grid, gaussian_kde(p0)(grid), color="tab:blue", lw=1.6)
+        if len(p1) > 3 and np.std(p1) > 1e-12:
+            ax.plot(grid, gaussian_kde(p1)(grid), color="tab:orange", lw=1.6)
+
+    ax.set_title(title)
+    ax.set_xlabel("P(sube)")
+    ax.set_ylabel("Densidad")
+    ax.set_xlim(0.0, 1.0)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper center", ncol=2)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_roc_pr_wf(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    threshold: float,
+    actual_col: str = "actual",
+    proba_col: str = "proba_up",
+) -> None:
+    dfp = wf_df[[actual_col, proba_col]].copy()
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return
+
+    y_true = dfp[actual_col].astype(int).to_numpy()
+    y_proba = np.clip(dfp[proba_col].astype(float).to_numpy(), 0.0, 1.0)
+
+    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(12.5, 5.2))
+    fig.suptitle(title, y=0.98)
+
+    if len(np.unique(y_true)) < 2:
+        ax_roc.text(0.5, 0.5, "ROC no definida\n(solo 1 clase)", ha="center", va="center", transform=ax_roc.transAxes)
+        ax_pr.text(0.5, 0.5, "PR no definida\n(solo 1 clase)", ha="center", va="center", transform=ax_pr.transAxes)
+    else:
+        fpr, tpr, _thr = roc_curve(y_true, y_proba)
+        roc_auc = float(roc_auc_score(y_true, y_proba))
+        ax_roc.plot(fpr, tpr, lw=1.8, label=f"ROC-AUC={roc_auc:.3f}")
+        ax_roc.plot([0, 1], [0, 1], linestyle="--", color="grey", lw=1.0)
+
+        # Punto operativo
+        y_pred_thr = (y_proba >= float(threshold)).astype(int)
+        cm = confusion_matrix(y_true, y_pred_thr, labels=[0, 1])
+        tn, fp, fn, tp = (int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1]))
+        fpr_thr = fp / (fp + tn) if (fp + tn) > 0 else np.nan
+        tpr_thr = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+        ax_roc.scatter([fpr_thr], [tpr_thr], s=45, color="black", zorder=5, label=f"thr={float(threshold):.2f}")
+
+        ax_roc.set_title("ROC")
+        ax_roc.set_xlabel("FPR")
+        ax_roc.set_ylabel("TPR")
+        ax_roc.set_xlim(0.0, 1.0)
+        ax_roc.set_ylim(0.0, 1.0)
+        ax_roc.grid(True, alpha=0.25)
+        ax_roc.legend(loc="lower right")
+
+        precision, recall, _thr_pr = precision_recall_curve(y_true, y_proba)
+        ap = float(average_precision_score(y_true, y_proba))
+        base_rate = float(np.mean(y_true))
+        ax_pr.plot(recall, precision, lw=1.8, label=f"AP={ap:.3f}")
+        ax_pr.axhline(base_rate, linestyle="--", color="grey", lw=1.0, label=f"Base-rate={base_rate:.3f}")
+
+        precision_thr = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+        recall_thr = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+        ax_pr.scatter([recall_thr], [precision_thr], s=45, color="black", zorder=5, label=f"thr={float(threshold):.2f}")
+
+        ax_pr.set_title("Precision-Recall")
+        ax_pr.set_xlabel("Recall")
+        ax_pr.set_ylabel("Precision")
+        ax_pr.set_xlim(0.0, 1.0)
+        ax_pr.set_ylim(0.0, 1.05)
+        ax_pr.grid(True, alpha=0.25)
+        ax_pr.legend(loc="lower left")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_metrics_by_proba_bin(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    threshold: float,
+    n_bins: int = 10,
+    actual_col: str = "actual",
+    proba_col: str = "proba_up",
+) -> None:
+    dfp = wf_df[[actual_col, proba_col]].copy()
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return
+
+    dfp["pred_thr"] = (dfp[proba_col].astype(float) >= float(threshold)).astype(int)
+
+    # Deciles por cuantiles (si hay duplicados, puede haber < n_bins grupos)
+    dfp["bin"] = pd.qcut(
+        dfp[proba_col].astype(float),
+        int(n_bins),
+        labels=False,
+        duplicates="drop",
+    )
+
+    rows = []
+    for b, g in dfp.groupby("bin"):
+        y_true = g[actual_col].astype(int).to_numpy()
+        y_pred = g["pred_thr"].astype(int).to_numpy()
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        tn, fp, fn, tp = (int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1]))
+        n = int(len(g))
+
+        acc = (tp + tn) / n if n > 0 else np.nan
+        prec = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+        rec = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+
+        rows.append({
+            "bin": int(b),
+            "n": n,
+            "accuracy": float(acc),
+            "precision": float(prec) if not pd.isna(prec) else np.nan,
+            "recall": float(rec) if not pd.isna(rec) else np.nan,
+        })
+
+    mdf = pd.DataFrame(rows).sort_values("bin")
+
+    fig, ax = plt.subplots(figsize=(9.0, 4.6))
+    ax.plot(mdf["bin"], mdf["accuracy"], marker="o", lw=1.8, label="Accuracy")
+    ax.plot(mdf["bin"], mdf["precision"], marker="o", lw=1.8, label="Precision")
+    ax.plot(mdf["bin"], mdf["recall"], marker="o", lw=1.8, label="Recall")
+
+    ax.set_title(title)
+    ax.set_xlabel("Decil de P(sube) (bajo → alto)")
+    ax.set_ylabel("Métrica")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="lower right", ncol=3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_cumulative_gains_wf(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    actual_col: str = "actual",
+    proba_col: str = "proba_up",
+) -> None:
+    dfp = wf_df[[actual_col, proba_col]].copy()
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return
+
+    dfp = dfp.sort_values(proba_col, ascending=False).reset_index(drop=True)
+    y_true = dfp[actual_col].astype(int).to_numpy()
+    total_pos = int(np.sum(y_true))
+    n = int(len(dfp))
+
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
+
+    if total_pos == 0:
+        ax.text(
+            0.5,
+            0.5,
+            "Cumulative gains no definido\n(no hay positivos)",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+    else:
+        cum_pos = np.cumsum(y_true)
+        x = np.arange(1, n + 1) / n  # fracción de muestras seleccionadas
+        gain = cum_pos / total_pos   # fracción de positivos capturados
+
+        ax.plot(x, gain, lw=2.0, label="Modelo")
+        ax.plot([0, 1], [0, 1], linestyle="--", color="grey", lw=1.2, label="Random")
+
+        # Lift en el top 10% (si existe)
+        k = max(1, int(round(0.10 * n)))
+        top_pos = int(np.sum(y_true[:k]))
+        lift10 = (top_pos / k) / (total_pos / n) if total_pos > 0 else np.nan
+        ax.scatter([k / n], [top_pos / total_pos], color="black", s=40, zorder=5)
+        ax.text(
+            k / n,
+            top_pos / total_pos,
+            f"  top10% lift={lift10:.2f}",
+            va="center",
+            ha="left",
+            fontsize=10,
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel("Fracción seleccionada (ordenado por P(sube) desc)")
+    ax.set_ylabel("Fracción de positivos capturados")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.02)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_rolling_accuracy_wf(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    window: int = 36,
+    date_col: str = "date",
+    actual_col: str = "actual",
+    pred_col: str = "pred",
+) -> None:
+    dfp = wf_df[[date_col, actual_col, pred_col]].copy()
+    dfp[date_col] = pd.to_datetime(dfp[date_col])
+    dfp = dfp.sort_values(date_col)
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return
+
+    correct = (dfp[actual_col].astype(int) == dfp[pred_col].astype(int)).astype(float)
+    roll = correct.rolling(int(window), min_periods=max(5, int(window // 3))).mean()
+
+    fig, ax = plt.subplots(figsize=(10.5, 4.2))
+    ax.plot(dfp[date_col], roll, color="tab:blue", lw=1.8, label=f"Rolling acc ({int(window)}m)")
+    ax.axhline(0.5, linestyle="--", color="grey", lw=1.0, alpha=0.8, label="0.50")
+    ax.set_title(title)
+    ax.set_xlabel("Fecha")
+    ax.set_ylabel("Accuracy")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="lower left")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_regime_performance_wf(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    regime_series: pd.Series,
+    date_col: str = "date",
+    actual_col: str = "actual",
+    pred_col: str = "pred",
+) -> pd.DataFrame:
+    dfp = wf_df[[date_col, actual_col, pred_col]].copy()
+    dfp[date_col] = pd.to_datetime(dfp[date_col])
+    dfp = dfp.sort_values(date_col)
+
+    reg = regime_series.copy()
+    if not isinstance(reg.index, pd.DatetimeIndex):
+        reg.index = pd.to_datetime(reg.index)
+    reg = reg.sort_index()
+
+    dfp = dfp.merge(reg.rename("regime"), left_on=date_col, right_index=True, how="left")
+    dfp = dfp.dropna(subset=["regime"])
+    if dfp.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for regime_name, g in dfp.groupby("regime"):
+        y_true = g[actual_col].astype(int).to_numpy()
+        y_pred = g[pred_col].astype(int).to_numpy()
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        tn, fp, fn, tp = (int(cm[0, 0]), int(cm[0, 1]), int(cm[1, 0]), int(cm[1, 1]))
+        n = int(len(g))
+        acc = (tp + tn) / n if n > 0 else np.nan
+        prec = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+        rec = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+        base_rate = float(np.mean(y_true)) if n > 0 else np.nan
+        rows.append(
+            {
+                "regime": str(regime_name),
+                "n": n,
+                "base_rate": base_rate,
+                "accuracy": float(acc),
+                "precision": float(prec) if not pd.isna(prec) else np.nan,
+                "recall": float(rec) if not pd.isna(rec) else np.nan,
+            }
+        )
+
+    rdf = pd.DataFrame(rows).sort_values("regime")
+    if rdf.empty:
+        return rdf
+
+    fig, ax = plt.subplots(figsize=(9.5, 4.8))
+    x = np.arange(len(rdf))
+    w = 0.25
+    ax.bar(x - w, rdf["accuracy"], width=w, label="Accuracy")
+    ax.bar(x, rdf["precision"], width=w, label="Precision")
+    ax.bar(x + w, rdf["recall"], width=w, label="Recall")
+    ax.set_xticks(x, labels=rdf["regime"].tolist())
+    ax.set_ylim(0.0, 1.05)
+    ax.set_title(title)
+    ax.set_ylabel("Métrica")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(loc="lower right", ncol=3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return rdf
+
+
+def plot_equity_curve_directional_wf(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    date_col: str = "date",
+    pred_col: str = "pred",
+    close_col: str = "close_t",
+    close_fwd_col: str = "close_t_plus_h",
+) -> None:
+    dfp = wf_df[[date_col, pred_col, close_col, close_fwd_col]].copy()
+    dfp[date_col] = pd.to_datetime(dfp[date_col])
+    dfp = dfp.sort_values(date_col)
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return
+
+    fwd_ret = dfp[close_fwd_col].astype(float).to_numpy() / dfp[close_col].astype(float).to_numpy() - 1.0
+    signal = dfp[pred_col].astype(int).to_numpy()
+    strat_ret = np.where(signal == 1, fwd_ret, 0.0)
+
+    equity_strat = np.cumprod(1.0 + np.nan_to_num(strat_ret, nan=0.0))
+    equity_bh = np.cumprod(1.0 + np.nan_to_num(fwd_ret, nan=0.0))
+
+    fig, ax = plt.subplots(figsize=(11.0, 4.8))
+    ax.plot(dfp[date_col], equity_bh, lw=1.8, color="tab:blue", alpha=0.75, label="Buy&Hold (horizon)")
+    ax.plot(dfp[date_col], equity_strat, lw=2.0, color="purple", label="Estrategia (pred=1)")
+    ax.set_title(title)
+    ax.set_xlabel("Fecha")
+    ax.set_ylabel("Equity (multiplicador)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper left")
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
@@ -670,7 +1293,15 @@ BASE_DIR.mkdir(exist_ok=True)
 
 
 
-correlation_report(df, features + ["target"])
+corr = correlation_report(df, features + ["target"])
+plot_correlation_heatmap(
+    corr,
+    out_path=BASE_DIR / "correlation_heatmap.png",
+    title="Matriz de correlación (Pearson)",
+    target_col="target",
+    max_vars=25,
+    top_k=20,
+)
 # La señal lineal es débil.
 # Eso es normal en mercados financieros.
 # Ninguna variable tiene correlación fuerte (> 0.3).
@@ -689,11 +1320,12 @@ print(df.head())
 # Detecta relación monotónica (no necesariamente lineal)
 # En mercados suele ser más informativo que Pearson
 # =========================================================
-from scipy.stats import spearmanr
-print("Spearman rank correlation vs target\n")
-for col in features:
-    rc = spearmanr(df[col], df["target"]).correlation
-    print(f"{col:35s} {rc:.3f}")
+spearman_corr = compute_spearman_rank_corr(df, features, target_col="target")
+plot_spearman_rank_corr_bar(
+    spearman_corr,
+    out_path=BASE_DIR / "spearman_rank_corr.png",
+    title="Spearman rank correlation vs target",
+)
 # Interpretación:
 # > 0.05 consistente ya es interesante en finanzas
 # Signo estable > magnitud
@@ -985,17 +1617,47 @@ while start < len(df) - test_size:
     # ===== avanzar con embargo =====
     start = test_end + embargo
 
-print("Walk-forward Accuracy promedio:", np.nanmean(accs))
-print("Walk-forward ROC-AUC promedio:", np.nanmean(aucs))
-print("Walk-forward PR-AUC (AvgPrecision) promedio:", np.nanmean(ap_scores))
-print("Walk-forward Balanced Accuracy promedio:", np.nanmean(bal_accs))
-print("Walk-forward LogLoss promedio:", np.nanmean(loglosses))
-print("Walk-forward Brier score promedio:", np.nanmean(briers))
+# Scorecards (sin prints) para memoria
+wf_metrics_scorecard = pd.DataFrame(
+    {
+        "Valor": [
+            float(np.nanmean(accs)),
+            float(np.nanmean(aucs)),
+            float(np.nanmean(ap_scores)),
+            float(np.nanmean(bal_accs)),
+            float(np.nanmean(loglosses)),
+            float(np.nanmean(briers)),
+        ]
+    },
+    index=[
+        "Accuracy (mean)",
+        "ROC-AUC (mean)",
+        "PR-AUC / AvgPrecision (mean)",
+        "Balanced Accuracy (mean)",
+        "LogLoss (mean)",
+        "Brier score (mean)",
+    ],
+)
+_save_table_figure(
+    wf_metrics_scorecard,
+    out_path=BASE_DIR / "walk_forward_metrics_scorecard.png",
+    title=f"Walk-Forward — Métricas promedio (horizonte {HORIZON}m)",
+)
 
-print("\nBaselines (comparación justa)")
-print("Baseline Accuracy (mayoría en train):", float(np.nanmean(baseline_accs)))
-print("Baseline LogLoss (p const = base-rate train):", float(np.nanmean(baseline_loglosses)))
-print("Umbral elegido (mediana folds):", float(np.nanmedian(fold_thresholds)))
+thr_median = float(np.nanmedian(fold_thresholds)) if len(fold_thresholds) else 0.5
+wf_baselines_table = pd.DataFrame(
+    {
+        "Accuracy": [float(np.nanmean(accs)), float(np.nanmean(baseline_accs))],
+        "LogLoss": [float(np.nanmean(loglosses)), float(np.nanmean(baseline_loglosses))],
+    },
+    index=["Modelo (WF)", "Baseline"],
+)
+_save_table_figure(
+    wf_baselines_table,
+    out_path=BASE_DIR / "walk_forward_baselines_scorecard.png",
+    title="Walk-Forward — Modelo vs Baselines",
+    footer=f"Umbral elegido (mediana folds): {thr_median:.3f}",
+)
 
 # Dataset WF para plots
 wf_df = pd.DataFrame({
@@ -1026,6 +1688,68 @@ plot_classification_timeline(
     year_locator=2,
 )
 
+# ── Calidad probabilística (WF) ──
+plot_calibration_curve_wf(
+    wf_df,
+    out_path=BASE_DIR / "walk_forward_calibration.png",
+    title=f"Walk-Forward — Calibration curve ({HORIZON}m)",
+    n_bins=10,
+)
+
+plot_proba_hist_by_class(
+    wf_df,
+    out_path=BASE_DIR / "walk_forward_proba_hist_by_class.png",
+    title=f"Walk-Forward — Distribución de P(sube) por clase ({HORIZON}m)",
+    bins=25,
+    kde=True,
+)
+
+plot_roc_pr_wf(
+    wf_df,
+    out_path=BASE_DIR / "walk_forward_roc_pr.png",
+    title=f"Walk-Forward — ROC & PR ({HORIZON}m)",
+    threshold=thr_wf,
+)
+
+plot_metrics_by_proba_bin(
+    wf_df,
+    out_path=BASE_DIR / "walk_forward_metrics_by_decile.png",
+    title=f"Walk-Forward — Accuracy/Precision/Recall por decil (thr={thr_wf:.2f})",
+    threshold=thr_wf,
+    n_bins=10,
+)
+
+plot_cumulative_gains_wf(
+    wf_df,
+    out_path=BASE_DIR / "walk_forward_cumulative_gains.png",
+    title=f"Walk-Forward — Cumulative gains / lift ({HORIZON}m)",
+)
+
+plot_rolling_accuracy_wf(
+    wf_df,
+    out_path=BASE_DIR / "walk_forward_rolling_accuracy_36m.png",
+    title=f"Walk-Forward — Rolling Accuracy (36m, horizonte {HORIZON}m)",
+    window=36,
+)
+
+# Performance por régimen macro (ej.: inflación alta/baja)
+if "high_inflation" in df.columns:
+    regime_series = df["high_inflation"].astype(float).map({1.0: "high_inflation", 0.0: "low_inflation"})
+    _regime_df = plot_regime_performance_wf(
+        wf_df,
+        out_path=BASE_DIR / "walk_forward_regime_performance.png",
+        title=f"Walk-Forward — Performance por régimen (high/low inflation)",
+        regime_series=regime_series,
+    )
+    if not _regime_df.empty:
+        print("\n[Regime performance]\n", _regime_df)
+
+plot_equity_curve_directional_wf(
+    wf_df,
+    out_path=BASE_DIR / "walk_forward_equity_curve_directional.png",
+    title=f"Walk-Forward — Equity curve direccional ({HORIZON}m)",
+)
+
 
 # ── Ranking power por deciles de probabilidad ──
 dec_df = wf_df.copy()
@@ -1045,6 +1769,14 @@ cm = confusion_matrix(wf_df["actual"], wf_df["pred"], labels=[0, 1])
 print("\nConfusion matrix global (WF):\n", cm)
 print("\nClassification report global (WF):\n")
 print(classification_report(wf_df["actual"], wf_df["pred"], digits=3))
+
+plot_confusion_matrix_wf(
+    wf_df["actual"],
+    wf_df["pred"],
+    out_path=BASE_DIR / "confusion_matrix_walk_forward.png",
+    title=f"Walk-Forward — Matriz de confusión {HORIZON}m",
+    class_labels=("0 (no sube)", "1 (sube)"),
+)
 
 
 # ==============================
@@ -1120,7 +1852,7 @@ print("Total invertido Señal:", float(sig_curve["invested"].dropna().iloc[-1]))
 
 
 
-
+exit(0)
 
 # ==============================
 # Final roll-out en últimos 10 años
