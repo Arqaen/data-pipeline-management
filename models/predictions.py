@@ -1,14 +1,52 @@
 from pathlib import Path
 from typing import Dict, List, Optional
-import shap
 import shutil
 import matplotlib.dates as mdates
+import shap 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.metrics import mean_squared_error, r2_score
 from xgboost import XGBRegressor
+from xgboost import XGBClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    roc_auc_score,
+    log_loss,
+    confusion_matrix,
+    classification_report,
+)
+
+
+
+def simulate_monthly_dca_roi(
+    prices: pd.Series,
+    contributions: pd.Series,
+) -> pd.DataFrame:
+    prices = prices.astype(float)
+    contributions = contributions.astype(float).reindex(prices.index).fillna(0.0)
+
+    shares_bought = contributions.div(prices).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    shares = shares_bought.cumsum()
+    invested = contributions.cumsum()
+    value = shares.mul(prices)
+    roi_pct = np.where(invested.values > 0, (value.values - invested.values) / invested.values * 100.0, np.nan)
+
+    return pd.DataFrame(
+        {
+            "price": prices,
+            "contribution": contributions,
+            "invested": invested,
+            "shares": shares,
+            "value": value,
+            "roi_pct": roi_pct,
+        },
+        index=prices.index,
+    )
 
 def correlation_report(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     corr = df[cols].corr()
@@ -200,7 +238,7 @@ df["sp500_horizon"] = df["Close"].pct_change(HORIZON)
 df["gdp_yoy"] = df["GDPC1"].pct_change(12)
 df["gdp_yoy_lag6"] = df["gdp_yoy"].shift(6)
 df["unemp_change_12m"] = df["UNRATE"].diff(12)
-df["fund_rate_change_3m"] = df["FEDFUNDS"].diff(12)
+df["fund_rate_change_3m"] = df["FEDFUNDS"].diff(3)
 df["vix_level"] = df["VIX_Close"]
 df["vix_3m_change"] = df["VIX_Close"].pct_change(3)
 df["m2_yoy"] = df["M2SL"].pct_change(12)
@@ -285,7 +323,6 @@ features = [
     "CORESTICKM159SFRBATL",
     "equity_risk_premium",
     "NFCI_3m_change",
-    # "momentum_12m",
     "real_rate_change_6m",
     "dxy_12m",
     "vix_z_score",
@@ -299,6 +336,11 @@ features = [
     "curve_slope",
     "USSLIND",
     "credit_spread",
+    "vol_regime",
+    "credit_stress",    
+    "recession",
+    "liquidity_trend",
+    "gdp_yoy_lag6",
 
 
     # "gdp_yoy_ma6",
@@ -306,11 +348,7 @@ features = [
     # "value_momentum",
     # "ret_6m",
     # "momentum_change",
-    "vol_regime",
-    "credit_stress",    
-    "recession",
-    "liquidity_trend",
-    "gdp_yoy_lag6",
+    # "momentum_12m",
     # "gdp_yoy",
     # "gdp_yoy_diff6",
     # "dxy_3m_change",
@@ -356,9 +394,9 @@ valid_features = [
     if df[f].notna().mean() > min_history
 ]
 dropped_features = [f for f in features if f not in valid_features]
-print("Features eliminadas por tener poco historial:")
-for f in dropped_features:
-    print(f)
+# print("Features eliminadas por tener poco historial:")
+# for f in dropped_features:
+#     print(f)
 features = valid_features
 
    
@@ -370,23 +408,22 @@ min_train_size = 180
 test_size = 12 
 
 
-# eliminar overlap
-# df = df.iloc[::HORIZON].copy()
-# clasifación
-# df["target"] = (df["future_return"] > 0.05).astype(int)
+
+# Clasificación: 1 si retorno futuro > umbral, 0 si no
 df["future_return"] = df["Close"].shift(-HORIZON) / df["Close"] - 1
-# ===============================
-# Target: cambio de tendencia
-# ===============================
-ret_fut = np.log(df["Close"]).diff(HORIZON).shift(-HORIZON)
-ret_past = np.log(df["Close"]).diff(HORIZON)
-df["target"] = ret_fut - ret_past
+df["close_fwd"] = df["Close"].shift(-HORIZON)
+df["target"] = (df["Close"].shift(-HORIZON) > df["Close"]).astype(int)
+df["target_reg"] = np.log(df["Close"].shift(-HORIZON) / df["Close"])
 
 df = df.replace([np.inf, -np.inf], np.nan)
 df = df.dropna(subset=["target"])
+df = df.dropna(subset=features)
+
+
+# eliminar overlap
+# df = df.iloc[::HORIZON].copy()
 # df[features] = df[features].fillna(0)
 # df[features] = df[features].ffill()
-df = df.dropna(subset=features)
 
 
 
@@ -423,15 +460,13 @@ print(df.head())
 # Detecta relación monotónica (no necesariamente lineal)
 # En mercados suele ser más informativo que Pearson
 # =========================================================
+# from scipy.stats import spearmanr
 
-from scipy.stats import spearmanr
+# print("Spearman rank correlation vs target\n")
 
-print("Spearman rank correlation vs target\n")
-
-for col in features:
-    rc = spearmanr(df[col], df["target"]).correlation
-    print(f"{col:35s} {rc:.3f}")
-
+# for col in features:
+#     rc = spearmanr(df[col], df["target"]).correlation
+#     print(f"{col:35s} {rc:.3f}")
 # Interpretación:
 # > 0.05 consistente ya es interesante en finanzas
 # Signo estable > magnitud
@@ -442,11 +477,11 @@ for col in features:
 # Mide si extremos de la variable predicen retornos distintos
 # Es mucho más útil que mirar solo correlación
 # =========================================================
-feature_to_test = f"cape_earnings_yield"   # cambia si quieres probar otra
-df["bin"] = pd.qcut(df[feature_to_test], 10, labels=False, duplicates="drop")
-decile_returns = df.groupby("bin")["target"].mean()
-print("\nRetorno medio por decil:")
-print(decile_returns)
+# feature_to_test = f"cape_earnings_yield"   # cambia si quieres probar otra
+# df["bin"] = pd.qcut(df[feature_to_test], 10, labels=False, duplicates="drop")
+# decile_returns = df.groupby("bin")["target"].mean()
+# print("\nRetorno medio por decil:")
+# print(decile_returns)
 # Interpretación:
 # Ideal: decil 9 >> decil 0
 # Relación creciente casi monotónica = señal robusta
@@ -458,47 +493,13 @@ print(decile_returns)
 # Permite ver asimetría, colas y sesgo estructural
 # Clave para interpretar R2 y MSE
 # =========================================================
-import matplotlib.pyplot as plt
 plt.figure(figsize=(8,4))
-df["target"].hist(bins=50)
+df["target_reg"].hist(bins=50)
 plt.title("Distribución del retorno futuro (target)")
 plt.axvline(0, linestyle="--")
-plt.savefig(BASE_DIR / "target_dist.png")
+plt.savefig(BASE_DIR / "return_dist.png")
 # Si está muy concentrado en 0 → modelo difícil
 # Si hay colas gordas → cuidado con MSE (dominado por outliers)
-
-
-
-
-# =========================================================
-# 4️⃣ Estabilidad temporal de la señal
-# Una señal buena debe funcionar en distintos regímenes
-# =========================================================
-df["decade"] = (df.index.year // 10) * 10
-print("\nCorrelación por década:\n")
-for col in ["cape_earnings_yield"]:   # puedes probar más features
-    for decade, sub in df.groupby("decade"):
-        corr = sub[col].corr(sub["target"])
-        print(f"{col} - {decade}s: {corr:.3f}")
-# Interpretación:
-# Si cambia de signo frecuentemente → probablemente ruido
-# Señal estable en el tiempo = mucho más valiosa
-
-
-
-# =========================================================
-# 5️⃣ Autocorrelación del Target
-# Mide si el retorno ene memoria propia
-# =========================================================
-auto_corr = df["target"].autocorr()
-print("\nAutocorrelación del target:", round(auto_corr, 3))
-# ~0  → mercado eficiente (normal)
-# Alta → ya existe momentum estructural
-
-
-
-
-
 
 
 
@@ -523,17 +524,30 @@ print("\nAutocorrelación del target:", round(auto_corr, 3))
 
 # Variables predictoras
 X = df[features]
-y = df["target"]
+y = df["target"].astype(int)
 
+base_rate = float(y.mean())
+print(f"Target base-rate (P(y=1)) en dataset: {base_rate:.3f}")
 
-correlations = []
-rank_correlations = []
-r2_scores = []
-mses = []
+# --- Walk-forward metrics ---
+accs = []
+aucs = []
+loglosses = []
+bal_accs = []
+ap_scores = []
+briers = []
 
-all_preds = []
+baseline_accs = []
+baseline_loglosses = []
+
+fold_thresholds = []
+
+all_proba = []
+all_pred = []
 all_actuals = []
 all_dates = []
+all_close = []
+all_close_fwd = []
 
 last_model = None
 
@@ -551,14 +565,19 @@ while start < len(df) - test_size:
     test_df = df.iloc[start:test_end]
 
     X_train = train_df[features]
-    y_train = train_df["target"]
+    y_train = train_df["target"].astype(int)
 
     X_test = test_df[features]
-    y_test = test_df["target"]
+    y_test = test_df["target"].astype(int)
 
-    model = XGBRegressor(
-        objective="reg:squarederror",
-        n_estimators=3000,
+    # balanceo opcional (solo si la clase positiva es rara)
+    pos = int((y_train == 1).sum())
+    neg = int((y_train == 0).sum())
+    scale_pos_weight = (neg / pos) if (pos > 0 and pos < neg) else 1.0
+
+    model = XGBClassifier(
+        objective="binary:logistic",
+        n_estimators=5000,
         learning_rate=0.01,
         max_depth=4,
         min_child_weight=1,
@@ -569,17 +588,18 @@ while start < len(df) - test_size:
         reg_lambda=3,
         random_state=42,
         tree_method="hist",
-        early_stopping_rounds=200
+        eval_metric="logloss",
+        early_stopping_rounds=200,
+        scale_pos_weight=scale_pos_weight,
     )
 
     # ===== Validation interna temporal =====
     val_size = int(len(X_train) * 0.2)
     gap = HORIZON
+    tr_end = -(val_size + gap)
 
-    train_end = -(val_size + gap)
-
-    X_tr = X_train.iloc[:train_end]
-    y_tr = y_train.iloc[:train_end]
+    X_tr = X_train.iloc[:tr_end]
+    y_tr = y_train.iloc[:tr_end]
 
     X_val = X_train.iloc[-val_size:]
     y_val = y_train.iloc[-val_size:]
@@ -593,158 +613,220 @@ while start < len(df) - test_size:
 
     last_model = model
 
-    preds = model.predict(X_test)
+    # Probabilidades
+    proba = model.predict_proba(X_test)[:, 1]
 
-    all_preds.extend(preds)
-    all_actuals.extend(y_test.values)
-    all_dates.extend(y_test.index)
+    # ===== Selección de umbral (en validación temporal) =====
+    # Nota: 0.5 rara vez es óptimo si la base-rate != 0.5.
+    val_proba = model.predict_proba(X_val)[:, 1]
+    thresholds = np.linspace(0.05, 0.95, 91)
+    best_thr = 0.5
+    best_score = -np.inf
+    if len(np.unique(y_val)) > 1:
+        for thr in thresholds:
+            vpred = (val_proba >= thr).astype(int)
+            score = balanced_accuracy_score(y_val, vpred)
+            if score > best_score:
+                best_score = score
+                best_thr = float(thr)
 
-    # ===== Métricas =====
-    if len(preds) > 1:
-        corr = pd.Series(preds).corr(pd.Series(y_test.values))
-        rank_corr = spearmanr(preds, y_test.values).correlation
-        r2 = r2_score(y_test.values, preds)
-        mse = mean_squared_error(y_test.values, preds)
+    fold_thresholds.append(best_thr)
+    pred = (proba >= best_thr).astype(int)
+
+    all_proba.extend(proba.tolist())
+    all_pred.extend(pred.tolist())
+    all_actuals.extend(y_test.values.tolist())
+    all_dates.extend(y_test.index.tolist())
+    all_close.extend(test_df["Close"].values.tolist())
+    all_close_fwd.extend(test_df["close_fwd"].values.tolist())
+
+    # ===== Baselines (para no engañarse) =====
+    # 1) Clasificador tonto: siempre predice la clase mayoritaria del TRAIN
+    majority_class = int(y_train.mean() >= 0.5)
+    baseline_pred = np.full_like(y_test.values, fill_value=majority_class)
+    baseline_accs.append(accuracy_score(y_test, baseline_pred))
+
+    # 2) Probabilidad constante: p = base-rate del TRAIN
+    p0 = float(np.clip(y_train.mean(), 1e-6, 1 - 1e-6))
+    baseline_loglosses.append(log_loss(y_test, np.full_like(proba, p0), labels=[0, 1]))
+
+    # ===== Métricas del modelo =====
+    accs.append(accuracy_score(y_test, pred))
+    bal_accs.append(balanced_accuracy_score(y_test, pred))
+
+    if len(np.unique(y_test)) > 1:
+        aucs.append(roc_auc_score(y_test, proba))
+        ap_scores.append(average_precision_score(y_test, proba))
     else:
-        corr = np.nan
-        rank_corr = np.nan
-        r2 = np.nan
-        mse = np.nan
+        aucs.append(np.nan)  # AUC no definido si solo hay una clase en el tramo
+        ap_scores.append(np.nan)
 
-    correlations.append(corr)
-    rank_correlations.append(rank_corr)
-    r2_scores.append(r2)
-    mses.append(mse)
+    loglosses.append(log_loss(y_test, proba, labels=[0, 1]))
+    briers.append(brier_score_loss(y_test, proba))
 
     # ===== avanzar con embargo =====
-    # start += test_size
     start = test_end + embargo
 
+print("Walk-forward Accuracy promedio:", np.nanmean(accs))
+print("Walk-forward ROC-AUC promedio:", np.nanmean(aucs))
+print("Walk-forward PR-AUC (AvgPrecision) promedio:", np.nanmean(ap_scores))
+print("Walk-forward Balanced Accuracy promedio:", np.nanmean(bal_accs))
+print("Walk-forward LogLoss promedio:", np.nanmean(loglosses))
+print("Walk-forward Brier score promedio:", np.nanmean(briers))
 
+print("\nBaselines (comparación justa)")
+print("Baseline Accuracy (mayoría en train):", float(np.nanmean(baseline_accs)))
+print("Baseline LogLoss (p const = base-rate train):", float(np.nanmean(baseline_loglosses)))
+print("Umbral elegido (mediana folds):", float(np.nanmedian(fold_thresholds)))
 
-print("Walk-forward Correlation promedio:", np.nanmean(correlations))
-print("Walk-forward Rank Correlation promedio:", np.nanmean(rank_correlations))
-print("Walk-forward R2 promedio:", np.nanmean(r2_scores))
-print("Walk-forward MSE promedio:", np.nanmean(mses))
-
-
-
-# ── Gráfico Walk-Forward: Predicción vs Real ──
+# Dataset WF para plots
 wf_df = pd.DataFrame({
     "date": pd.to_datetime(all_dates),
-    "predicted": all_preds,
-    "actual": all_actuals
+    "proba_up": all_proba,   # prob. de clase positiva (sube)
+    "pred": all_pred,
+    "actual": all_actuals,
+    "close_t": all_close,
+    "close_t_plus_h": all_close_fwd,
 })
 wf_df = (
     wf_df.sort_values("date")
     .drop_duplicates(subset="date", keep="last")
     .reset_index(drop=True)
 )
-wf_df["signal_raw"] = wf_df["predicted"]
-wf_df["signal"] = wf_df["predicted"].rolling(3).mean()
-fig, ax = plt.subplots(figsize=(14,5))
-ax.plot(wf_df["date"], wf_df["actual"], 
-        label="Cambio tendencia real", 
-        color="black", alpha=0.7)
-ax.plot(wf_df["date"], wf_df["signal_raw"], 
-        label="Predicción modelo", 
-        color="purple", alpha=0.3)
-ax.plot(wf_df["date"], wf_df["signal"], 
-        label="Señal suavizada (3)", 
-        color="purple", linewidth=2)
-ax.axhline(0, color="grey", linewidth=0.6, linestyle="--")
-ax.fill_between(
+
+# Señal suavizada sobre probabilidad
+wf_df["signal_raw"] = wf_df["proba_up"]
+wf_df["signal"] = wf_df["proba_up"] - 0.5
+
+# ── Gráfico Walk-Forward: probabilidad vs clase real ──
+fig, ax = plt.subplots(figsize=(14, 5))
+
+ax.plot(
     wf_df["date"],
     wf_df["actual"],
-    wf_df["signal"],
-    alpha=0.12,
-    color="purple"
+    label="Clase real (0/1)",
+    color="black",
+    alpha=0.6,
+    drawstyle="steps-post",
 )
-ax.set_title(f"Walk-Forward — Cambio de tendencia {HORIZON}m")
-ax.set_ylabel("Cambio de tendencia")
+# ax.plot(
+#     wf_df["date"],
+#     wf_df["signal_raw"],
+#     label="P(sube) modelo",
+#     color="purple",
+#     alpha=0.25,
+# )
+
+# Precio en eje secundario para ver confirmación visual
+ax2 = ax.twinx()
+ax2.plot(
+    wf_df["date"],
+    wf_df["close_t"],
+    label="Precio (Close t)",
+    color="tab:blue",
+    alpha=0.5,
+)
+ax2.plot(
+    wf_df["date"],
+    wf_df["close_t_plus_h"],
+    label=f"Precio (Close t+{HORIZON}m)",
+    color="tab:blue",
+    alpha=0.35,
+    linestyle="--",
+)
+ax2.set_ylabel("Precio (Close)")
+ax2.set_yscale("log")
+
+ax.set_title(
+    f"Walk-Forward — Clasificación {HORIZON}m (P(sube)) + Precio (t y t+{HORIZON}m)"
+)
+ax.set_ylabel("Probabilidad / Clase")
+ax.set_ylim(-0.05, 1.05)
 ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 ax.xaxis.set_major_locator(mdates.YearLocator(2))
 fig.autofmt_xdate()
-ax.legend()
+
+# Leyenda combinada
+lines1, labels1 = ax.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+
 ax.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.savefig(BASE_DIR / "walk_forward_predictions.png")
+plt.savefig(BASE_DIR / "walk_forward_classification.png")
 
 
-
-
-# ── Gráfico Precio vs Señal de Tendencia ──
-fig, ax1 = plt.subplots(figsize=(14,5))
-ax1.plot(df.index, df["Close"], color="black", label="S&P500")
-ax1.set_yscale("log")
-ax1.set_ylabel("Precio")
-ax2 = ax1.twinx()
-signal = wf_df.set_index("date")["signal"]
-ax2.plot(signal.index, signal, color="purple", label="Señal modelo")
-ax2.fill_between(
-    signal.index,
-    0,
-    signal,
-    where=signal > 0,
-    color="green",
-    alpha=0.15
-)
-ax2.fill_between(
-    signal.index,
-    0,
-    signal,
-    where=signal < 0,
-    color="red",
-    alpha=0.15
-)
-ax2.axhline(0, linestyle="--", color="grey")
-ax1.set_title("Precio vs señal de cambio de tendencia")
-fig.tight_layout()
-fig.savefig(BASE_DIR / "price_vs_signal.png")
-
-
-
-# ── Scatter Plot ──
-fig, ax = plt.subplots(figsize=(6,6))
-ax.scatter(wf_df["predicted"], wf_df["actual"], alpha=0.4)
-ax.axhline(0,color="grey")
-ax.axvline(0,color="grey")
-ax.set_xlabel("Predicción")
-ax.set_ylabel("Target real")
-ax.set_title("Predicción vs cambio de tendencia real")
-plt.tight_layout()
-plt.savefig(BASE_DIR / "prediction_scatter.png")
-
-
-
-
-# ── Ranking power ──
+# ── Ranking power por deciles de probabilidad ──
 dec_df = wf_df.copy()
-dec_df["decile"] = pd.qcut(dec_df["predicted"], 10, labels=False)
+dec_df["decile"] = pd.qcut(dec_df["proba_up"], 10, labels=False, duplicates="drop")
 deciles = dec_df.groupby("decile")["actual"].mean()
-fig, ax = plt.subplots(figsize=(8,4))
+
+fig, ax = plt.subplots(figsize=(8, 4))
 deciles.plot(kind="bar", ax=ax)
-ax.set_title("Cambio de tendencia medio por decil de predicción")
-ax.set_xlabel("Decil predicción (bajo → alto)")
-ax.set_ylabel("Target medio")
+ax.set_title("Tasa de acierto (clase=1) por decil de P(sube)")
+ax.set_xlabel("Decil P(sube) (bajo → alto)")
+ax.set_ylabel("P(real=1)")
 plt.tight_layout()
-plt.savefig(BASE_DIR / "decile_plot.png")
+plt.savefig(BASE_DIR / "decile_plot_classification.png")
+
+# ── Confusion matrix global (sobre todo el WF) ──
+cm = confusion_matrix(wf_df["actual"], wf_df["pred"], labels=[0, 1])
+print("\nConfusion matrix global (WF):\n", cm)
+print("\nClassification report global (WF):\n")
+print(classification_report(wf_df["actual"], wf_df["pred"], digits=3))
 
 
+# ==============================
+# ROI: Buy&Hold DCA vs Señal (2x cuando pred=1)
+# ==============================
+monthly_amount = 1.0
+signal_multiplier = 2.0
 
-# ── Rolling information coef ──
-rolling_ic = (
-    wf_df["predicted"]
-    .rolling(60)
-    .corr(wf_df["actual"])
+wf_signal = wf_df[["date", "pred"]].copy()
+wf_signal["date"] = pd.to_datetime(wf_signal["date"])
+wf_signal = wf_signal.set_index("date").sort_index()
+
+eval_start = pd.to_datetime(wf_df["date"].min())
+eval_end = pd.to_datetime(wf_df["date"].max())
+
+prices_eval = df.loc[eval_start:eval_end, "Close"].copy()
+pred_aligned = wf_signal["pred"].reindex(prices_eval.index)
+
+# Comparación justa: usar SOLO los meses en los que hay predicción walk-forward.
+has_pred = pred_aligned.notna()
+prices_eval = prices_eval.loc[has_pred]
+pred_aligned = pred_aligned.loc[has_pred]
+
+contrib_bh = pd.Series(monthly_amount, index=prices_eval.index)
+contrib_signal = pd.Series(0.0, index=prices_eval.index)
+contrib_signal[pred_aligned.fillna(0).astype(int) == 1] = monthly_amount * signal_multiplier
+
+bh_curve = simulate_monthly_dca_roi(prices_eval, contrib_bh)
+sig_curve = simulate_monthly_dca_roi(prices_eval, contrib_signal)
+
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.plot(bh_curve.index, bh_curve["roi_pct"], label=f"Buy&Hold DCA (x={monthly_amount:g}/mes)", color="tab:blue")
+ax.plot(
+    sig_curve.index,
+    sig_curve["roi_pct"],
+    label=f"Señal (comprar {signal_multiplier:g}x si pred=1)",
+    color="purple",
 )
-fig, ax = plt.subplots(figsize=(14,4))
-ax.plot(wf_df["date"], rolling_ic, color="purple")
-ax.axhline(0, linestyle="--", color="grey")
-ax.set_title("Rolling Information Coefficient (60)")
-ax.set_ylabel("IC")
+
+ax.axhline(0, linestyle="--", color="grey", alpha=0.6)
+ax.set_title(f"ROI acumulado (%) — DCA mensual vs Señal (Walk-Forward, horizonte {HORIZON}m)")
+ax.set_ylabel("ROI (%)")
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+ax.xaxis.set_major_locator(mdates.YearLocator(2))
+ax.grid(True, alpha=0.3)
+ax.legend(loc="upper left")
 plt.tight_layout()
-plt.savefig(BASE_DIR / "rolling_ic.png")
+plt.savefig(BASE_DIR / "roi_strategies_walk_forward.png")
+
+print("\nROI final Buy&Hold DCA (%):", float(bh_curve["roi_pct"].dropna().iloc[-1]))
+print("ROI final Señal 2x si pred=1 (%):", float(sig_curve["roi_pct"].dropna().iloc[-1]))
+print("Total invertido Buy&Hold:", float(bh_curve["invested"].dropna().iloc[-1]))
+print("Total invertido Señal:", float(sig_curve["invested"].dropna().iloc[-1]))
 
 
 
@@ -752,48 +834,18 @@ plt.savefig(BASE_DIR / "rolling_ic.png")
 
 
 
-# ── Strategy ──
-future_return = np.log(df["Close"]).diff(HORIZON).shift(-HORIZON)
-ret_past = np.log(df["Close"]).diff(HORIZON)
-strat_df = wf_df.copy()
-strat_df["future_return"] = future_return.loc[strat_df["date"]].values
-strat_df["ret_past"] = ret_past.loc[strat_df["date"]].values
-# reconstruir retorno esperado
-strat_df["ret_future_pred"] = strat_df["predicted"] + strat_df["ret_past"]
-# posición proporcional
-strat_df["position"] = strat_df["ret_future_pred"]
-strat_df["position"] /= strat_df["position"].abs().mean()
-# retorno estrategia (ajustado horizonte)
-strat_df["strategy"] = strat_df["position"] * strat_df["future_return"] / HORIZON
-equity = (1 + strat_df["strategy"]).cumprod()
-equity = (1 + strat_df["strategy"]).cumprod()
-fig, ax = plt.subplots(figsize=(14,5))
-ax.plot(strat_df["date"], equity, label="Estrategia modelo")
-ax.set_title("Equity curve estrategia simple")
-ax.set_yscale("log")
-ax.legend()
-plt.tight_layout()
-plt.savefig(BASE_DIR / "strategy_equity.png")
 
-benchmark = (1 + strat_df["future_return"] / HORIZON).cumprod()
-ax.plot(strat_df["date"], benchmark, label="Buy & Hold", alpha=0.7)
-plt.tight_layout()
-plt.savefig(BASE_DIR / "benchmark.png")
+
+
+exit(0)
 
 
 
 
-
-print()
-
-if last_model is not None:
-    last_X = X.iloc[[-1]]
-    walk_pred = last_model.predict(last_X)[0]
-    print(f"Predicción retorno {HORIZON} meses (walk):", walk_pred)
-
-final_model= XGBRegressor(
-    objective="reg:squarederror",
-    n_estimators=3000,
+# ===== Modelo final entrenado en todo el dataset =====
+final_model = XGBClassifier(
+    objective="binary:logistic",
+    n_estimators=5000,
     learning_rate=0.01,
     max_depth=4,
     min_child_weight=1,
@@ -804,98 +856,66 @@ final_model= XGBRegressor(
     reg_lambda=3,
     random_state=42,
     tree_method="hist",
+    eval_metric="logloss",
 )
 
 final_model.fit(X, y)
 
 last_X = X.iloc[[-1]]
-final_pred = final_model.predict(last_X)[0]
+final_proba = float(final_model.predict_proba(last_X)[:, 1][0])
+final_pred = int(final_proba >= 0.5)
 
 print("Última fecha:", X.index[-1])
-print(f"Predicción retorno {HORIZON} meses:", final_pred)
-
-
-
-
-
-
-
-
-
-
-
-
-
-import shap
-import matplotlib.pyplot as plt
+print(f"P(sube) en {HORIZON} meses:", final_proba)
+print("Predicción clase (>=0.5):", final_pred)
 
 # ==============================
-# SHAP EXPLAINER
+# SHAP (clasificación binaria)
 # ==============================
-
 explainer = shap.TreeExplainer(final_model)
 
-# SHAP values para todo el dataset
 shap_values = explainer.shap_values(X)
-
-
-# ==============================
-# SHAP SUMMARY PLOT
-# (features más importantes)
-# ==============================
-
-plt.figure()
-shap.summary_plot(shap_values, X, show=False)
-plt.tight_layout()
-plt.savefig(BASE_DIR / "shap_summary.png")
-
-
-# ==============================
-# SHAP BAR IMPORTANCE
-# (ranking de importancia)
-# ==============================
+# En binario, a veces viene como lista [clase0, clase1]; nos quedamos con clase 1
+if isinstance(shap_values, list) and len(shap_values) == 2:
+    shap_values_pos = shap_values[1]
+    expected_value = explainer.expected_value[1] if isinstance(explainer.expected_value, (list, np.ndarray)) else explainer.expected_value
+else:
+    shap_values_pos = shap_values
+    expected_value = explainer.expected_value
 
 plt.figure()
-shap.summary_plot(shap_values, X, plot_type="bar", show=False)
+shap.summary_plot(shap_values_pos, X, show=False)
 plt.tight_layout()
-plt.savefig(BASE_DIR / "shap_importance_bar.png")
-
-
-# ==============================
-# SHAP DEPENDENCE PLOT
-# (relación feature -> predicción)
-# ==============================
-
-for feature in X.columns:
-    
-    plt.figure()
-    shap.dependence_plot(feature, shap_values, X, show=False)
-    
-    fname = f"shap_dependence_{feature}.png"
-    plt.tight_layout()
-    plt.savefig(BASE_DIR / fname)
-
-
-# ==============================
-# SHAP para la última predicción
-# (explicar por qué predice +15%)
-# ==============================
-
-last_X = X.iloc[[-1]]
-
-shap_values_last = explainer.shap_values(last_X)
+plt.savefig(BASE_DIR / "shap_summary_cls.png")
 
 plt.figure()
-
-shap.plots.waterfall(
-    shap.Explanation(
-        values=shap_values_last[0],
-        base_values=explainer.expected_value,
-        data=last_X.iloc[0],
-        feature_names=X.columns
-    ),
-    show=False
-)
-
+shap.summary_plot(shap_values_pos, X, plot_type="bar", show=False)
 plt.tight_layout()
-plt.savefig(BASE_DIR / "shap_last_prediction.png")
+plt.savefig(BASE_DIR / "shap_importance_bar_cls.png")
+
+# for feature in X.columns:
+#     plt.figure()
+#     shap.dependence_plot(feature, shap_values_pos, X, show=False)
+#     fname = f"shap_dependence_cls_{feature}.png"
+#     plt.tight_layout()
+#     plt.savefig(BASE_DIR / fname)
+
+# SHAP para la última predicción (clase positiva)
+# shap_values_last = explainer.shap_values(last_X)
+# if isinstance(shap_values_last, list) and len(shap_values_last) == 2:
+#     shap_values_last_pos = shap_values_last[1][0]
+# else:
+#     shap_values_last_pos = shap_values_last[0]
+
+# plt.figure()
+# shap.plots.waterfall(
+#     shap.Explanation(
+#         values=shap_values_last_pos,
+#         base_values=expected_value,
+#         data=last_X.iloc[0],
+#         feature_names=X.columns
+#     ),
+#     show=False
+# )
+# plt.tight_layout()
+# plt.savefig(BASE_DIR / "shap_last_prediction_cls.png")
