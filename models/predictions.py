@@ -39,19 +39,23 @@ def tune_xgb_random_search_timeval(
     n_iter: int = 30,
     random_state: int = 42,
     scale_pos_weight: float = 1.0,
-) -> Tuple[Dict, int, float]:
+) -> Tuple[Dict, float]:
     """Random search con validación temporal (X_tr -> early-stopping -> scoring).
 
     - Sin RandomizedSearchCV (que no encaja bien con early_stopping + embargo).
     - Score: maximiza ROC-AUC en el bloque de scoring.
 
-    Devuelve: (best_params, best_n_estimators, best_roc_auc)
+    Devuelve: (best_params, best_score)
+
+    Nota: `n_estimators` NO se optimiza aquí. Se asume fijo en `fixed_params`
+    (early-stopping puede cortar antes, pero no devolvemos/ajustamos un
+    `best_n_estimators` explícito).
     """
     rng = np.random.RandomState(random_state)
 
     best_params: Dict = {}
     best_score = -np.inf
-    best_n_estimators = int(fixed_params.get("n_estimators", 5000))
+    fixed_n_estimators = int(fixed_params.get("n_estimators", 5000))
 
     # Si no hay suficientes clases, log_loss sigue siendo válido con labels=[0,1]
     # pero el tuning puede ser poco informativo. Aun así, lo dejamos correr.
@@ -76,25 +80,15 @@ def tune_xgb_random_search_timeval(
             # ROC-AUC no definido con una sola clase; fallback a -logloss para poder comparar.
             score = -float(log_loss(y_score, score_proba, labels=[0, 1]))
 
-        # best_iteration está disponible cuando hay early_stopping
-        bi = getattr(model, "best_iteration", None)
-        if bi is not None:
-            n_estimators = int(bi) + 1
-        else:
-            n_estimators = int(fixed_params.get("n_estimators", 5000))
-
         if score > best_score:
             best_score = score
             best_params = params
 
-            # Guardar también el tamaño efectivo del modelo
-            best_n_estimators = n_estimators
-
     print(
-        f"[RandomSearch] best ROC-AUC(score)={best_score:.5f} "
-        f"best_n_estimators={best_n_estimators} params={best_params}"
+        f"[RandomSearch] best score={best_score:.5f} "
+        f"n_estimators(fijo)={fixed_n_estimators} params={best_params}"
     )
-    return best_params, best_n_estimators, float(best_score)
+    return best_params, float(best_score)
 
 
 
@@ -607,25 +601,43 @@ print(f"Target base-rate (P(y=1)) en dataset: {base_rate:.3f}")
 # =============================
 # Random Search (hiperparámetros)
 # =============================
-DO_RANDOM_SEARCH = True
+DO_RANDOM_SEARCH = False
 TUNE_EACH_FOLD = False  # True = tunear en cada ventana; False = tunear 1 vez y reutilizar
-RANDOM_SEARCH_N_ITER = 500
+RANDOM_SEARCH_N_ITER = 200
 RANDOM_SEARCH_SEED = 42
 SCORE_FRAC = 0.5  # fracción del bloque de validación reservada para scoring (ROC-AUC) + umbral
 
 param_dist = {
-    "learning_rate": [0.005, 0.01, 0.02, 0.05],
-    "max_depth": [3, 4, 5, 6],
-    "min_child_weight": [1, 3, 5, 8, 12],
-    "gamma": [0, 0.5, 1, 2, 5],
-    "subsample": [0.6, 0.7, 0.8, 0.9],
-    # "colsample_bytree": [0.6, 0.7, 0.8, 0.9],
-    "reg_lambda": [3, 5, 10, 15, 20],
-    # "reg_alpha": [0, 0.1, 0.5, 1],
+    "learning_rate": [0.03, 0.05, 0.07],
+    "max_depth": [4, 5],
+    "min_child_weight": [5, 6],
+    "gamma": [0.5, 1],
+    "reg_lambda": [8, 10, 12],
+    "reg_alpha": [0.05, 0.1, 0.2],
 }
 
+# Params base (reutilizables)
+fixed_params_base = dict(
+    objective="binary:logistic",
+    n_estimators=5000,
+    random_state=42,
+    tree_method="hist",
+    eval_metric="auc",
+    early_stopping_rounds=200,
+    subsample=0.9,
+    colsample_bytree=0.8,
+)
+
+manual_params_base = dict(
+    learning_rate=0.05,
+    max_depth=5,
+    min_child_weight=5,
+    gamma=1.0,
+    reg_alpha=0.1,
+    reg_lambda=10,
+)
+
 best_params_global: Optional[Dict] = None
-best_n_estimators_global: Optional[int] = None
 
 # --- Walk-forward metrics ---
 accs = []
@@ -673,6 +685,10 @@ while start < len(df) - test_size:
     neg = int((y_train == 0).sum())
     scale_pos_weight = (neg / pos) if (pos > 0 and pos < neg) else 1.0
 
+    # Si desactivas el random search, usa configuración fija (sin re-balanceo)
+    if not DO_RANDOM_SEARCH:
+        scale_pos_weight = 1.0
+
     # ===== Validation interna temporal =====
     val_size = int(len(X_train) * 0.2)
     gap = HORIZON
@@ -702,19 +718,19 @@ while start < len(df) - test_size:
         X_score = X_val.iloc[es_size:]
         y_score = y_val.iloc[es_size:]
 
-    # ===== Random Search (opcional) =====
-    fixed_params = dict(
-        objective="binary:logistic",
-        n_estimators=5000,
-        random_state=42,
-        tree_method="hist",
-        eval_metric="auc",
-        early_stopping_rounds=200,
-    )
 
-    if DO_RANDOM_SEARCH and (TUNE_EACH_FOLD or best_params_global is None):
+
+
+
+    # ===== Random Search (opcional) =====
+    fixed_params = dict(fixed_params_base)
+    manual_params = dict(manual_params_base)
+
+    if not DO_RANDOM_SEARCH:
+        best_params = manual_params
+    elif DO_RANDOM_SEARCH and (TUNE_EACH_FOLD or best_params_global is None):
         # Nota: el tuning usa solo (X_tr -> X_val). No toca el test.
-        best_params, best_n_estimators, _best_val_score = tune_xgb_random_search_timeval(
+        best_params, _best_val_score = tune_xgb_random_search_timeval(
             X_tr,
             y_tr,
             X_es,
@@ -729,23 +745,19 @@ while start < len(df) - test_size:
         )
         if not TUNE_EACH_FOLD:
             best_params_global = best_params
-            best_n_estimators_global = best_n_estimators
     else:
         best_params = best_params_global or {}
-        best_n_estimators = best_n_estimators_global
 
-    # Aplicar best_n_estimators si lo tenemos; si no, usar el máximo (early stopping recorta)
-    if best_n_estimators is None:
-        best_n_estimators = int(fixed_params.get("n_estimators", 5000))
-
-    print(
-        f"[Fold] usando best_params={best_params} "
-        f"best_n_estimators={int(best_n_estimators)} scale_pos_weight={scale_pos_weight:.3f}"
-    )
-
+    # print(f"[Fold] usando best_params={best_params} ")
     fold_fixed_params = dict(fixed_params)
-    fold_fixed_params["n_estimators"] = int(best_n_estimators)
 
+
+
+
+
+
+
+    # ===== Entrenar modelo =====
     model = XGBClassifier(
         **fold_fixed_params,
         **best_params,
@@ -985,26 +997,25 @@ print("Total invertido Señal:", float(sig_curve["invested"].dropna().iloc[-1]))
 
 
 
-exit(0)
-
-
-
 
 # ===== Modelo final entrenado en todo el dataset =====
-final_model = XGBClassifier(
+final_fixed_params = dict(
     objective="binary:logistic",
     n_estimators=5000,
-    learning_rate=0.01,
-    max_depth=4,
-    min_child_weight=1,
-    gamma=0,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    reg_alpha=0.1,
-    reg_lambda=3,
     random_state=42,
     tree_method="hist",
-    eval_metric="logloss",
+    eval_metric="auc",
+    subsample=0.9,
+    colsample_bytree=0.8,
+)
+
+final_best_params = manual_params_base if not DO_RANDOM_SEARCH else (best_params_global or manual_params_base)
+final_scale_pos_weight = 1.0 if not DO_RANDOM_SEARCH else float((y == 0).sum() / max(1, (y == 1).sum()))
+
+final_model = XGBClassifier(
+    **final_fixed_params,
+    **final_best_params,
+    scale_pos_weight=final_scale_pos_weight,
 )
 
 final_model.fit(X, y)
@@ -1041,29 +1052,29 @@ shap.summary_plot(shap_values_pos, X, plot_type="bar", show=False)
 plt.tight_layout()
 plt.savefig(BASE_DIR / "shap_importance_bar_cls.png")
 
-# for feature in X.columns:
-#     plt.figure()
-#     shap.dependence_plot(feature, shap_values_pos, X, show=False)
-#     fname = f"shap_dependence_cls_{feature}.png"
-#     plt.tight_layout()
-#     plt.savefig(BASE_DIR / fname)
+for feature in X.columns:
+    plt.figure()
+    shap.dependence_plot(feature, shap_values_pos, X, show=False)
+    fname = f"shap_dependence_cls_{feature}.png"
+    plt.tight_layout()
+    plt.savefig(BASE_DIR / fname)
 
 # SHAP para la última predicción (clase positiva)
-# shap_values_last = explainer.shap_values(last_X)
-# if isinstance(shap_values_last, list) and len(shap_values_last) == 2:
-#     shap_values_last_pos = shap_values_last[1][0]
-# else:
-#     shap_values_last_pos = shap_values_last[0]
+shap_values_last = explainer.shap_values(last_X)
+if isinstance(shap_values_last, list) and len(shap_values_last) == 2:
+    shap_values_last_pos = shap_values_last[1][0]
+else:
+    shap_values_last_pos = shap_values_last[0]
 
-# plt.figure()
-# shap.plots.waterfall(
-#     shap.Explanation(
-#         values=shap_values_last_pos,
-#         base_values=expected_value,
-#         data=last_X.iloc[0],
-#         feature_names=X.columns
-#     ),
-#     show=False
-# )
-# plt.tight_layout()
-# plt.savefig(BASE_DIR / "shap_last_prediction_cls.png")
+plt.figure()
+shap.plots.waterfall(
+    shap.Explanation(
+        values=shap_values_last_pos,
+        base_values=expected_value,
+        data=last_X.iloc[0],
+        feature_names=X.columns
+    ),
+    show=False
+)
+plt.tight_layout()
+plt.savefig(BASE_DIR / "shap_last_prediction_cls.png")
