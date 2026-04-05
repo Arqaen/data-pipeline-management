@@ -25,7 +25,6 @@ from sklearn.metrics import (
 def _sample_param_combo(param_dist: Dict[str, List], rng: np.random.RandomState) -> Dict:
     return {key: rng.choice(values) for key, values in param_dist.items()}
 
-
 def tune_xgb_random_search_timeval(
     X_tr: pd.DataFrame,
     y_tr: pd.Series,
@@ -90,8 +89,6 @@ def tune_xgb_random_search_timeval(
     )
     return best_params, float(best_score)
 
-
-
 def simulate_monthly_dca_roi(
     prices: pd.Series,
     contributions: pd.Series,
@@ -127,6 +124,169 @@ def correlation_report(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 
 def _has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
     return all(c in df.columns for c in cols)
+
+def plot_classification_timeline(
+    plot_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    threshold: float = 0.5,
+    year_locator: int = 2,
+    date_col: str = "date",
+    proba_col: str = "proba_up",
+    pred_col: str = "pred",
+    actual_col: str = "actual",
+    price_col: str = "close_t",
+    price_fwd_col: str = "close_t_plus_h",
+) -> None:
+    dfp = plot_df.copy()
+    dfp[date_col] = pd.to_datetime(dfp[date_col])
+    dfp = dfp.sort_values(date_col).reset_index(drop=True)
+
+    if dfp.empty:
+        return
+
+    ends = dfp[date_col].shift(-1)
+    if len(dfp) > 1:
+        step = dfp[date_col].diff().dropna().median()
+        if pd.isna(step) or step <= pd.Timedelta(0):
+            step = pd.Timedelta(days=31)
+    else:
+        step = pd.Timedelta(days=31)
+    ends.iloc[-1] = dfp.loc[len(dfp) - 1, date_col] + step
+
+    y_true = dfp[actual_col].astype(int).to_numpy()
+    y_pred = dfp[pred_col].astype(int).to_numpy()
+
+    # Outcome codes: 0 TN, 1 FP, 2 FN, 3 TP
+    outcome = np.zeros_like(y_true)
+    outcome[(y_true == 0) & (y_pred == 1)] = 1
+    outcome[(y_true == 1) & (y_pred == 0)] = 2
+    outcome[(y_true == 1) & (y_pred == 1)] = 3
+
+    colors = {
+        0: ("TN", "tab:blue"),
+        1: ("FP", "tab:red"),
+        2: ("FN", "tab:orange"),
+        3: ("TP", "tab:green"),
+    }
+
+    acc = float(accuracy_score(y_true, y_pred))
+    bal_acc = float(balanced_accuracy_score(y_true, y_pred))
+
+    fig, (ax0, ax1) = plt.subplots(
+        2,
+        1,
+        figsize=(14, 7),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3.2, 1.4]},
+    )
+
+    for i in range(len(dfp)):
+        _, col = colors[int(outcome[i])]
+        ax0.axvspan(dfp.loc[i, date_col], ends.iloc[i], color=col, alpha=0.10, lw=0)
+        ax1.axvspan(dfp.loc[i, date_col], ends.iloc[i], color=col, alpha=0.10, lw=0)
+
+    # ax0.plot(
+    #     dfp[date_col],
+    #     dfp[actual_col],
+    #     label="Clase real (0/1)",
+    #     color="black",
+    #     alpha=0.70,
+    #     lw=1.6,
+    #     drawstyle="steps-post",
+    #     zorder=3,
+    # )
+    ax0.plot(
+        dfp[date_col],
+        dfp[pred_col],
+        label="Predicción de clase (0/1)",
+        color="tab:orange",
+        alpha=0.85,
+        lw=1.6,
+        drawstyle="steps-post",
+        zorder=3,
+    )
+    ax0.set_ylim(-0.05, 1.05)
+    ax0.set_ylabel("Clase")
+
+    ax0b = ax0.twinx()
+    if price_col in dfp.columns:
+        ax0b.plot(
+            dfp[date_col],
+            dfp[price_col],
+            label="Precio (Close t)",
+            color="tab:blue",
+            alpha=0.35,
+            lw=1.2,
+        )
+    # if price_fwd_col in dfp.columns:
+    #     ax0b.plot(
+    #         dfp[date_col],
+    #         dfp[price_fwd_col],
+    #         label=f"Precio (Close t+{HORIZON}m)",
+    #         color="tab:blue",
+    #         alpha=0.20,
+    #         lw=1.0,
+    #         linestyle="--",
+    # )
+    ax0b.set_ylabel("Precio (Close)")
+    ax0b.set_yscale("log")
+
+    lines0, labels0 = ax0.get_legend_handles_labels()
+    lines0b, labels0b = ax0b.get_legend_handles_labels()
+    ax0.legend(lines0 + lines0b, labels0 + labels0b, loc="upper left")
+
+    if proba_col in dfp.columns:
+        ax1.plot(
+            dfp[date_col],
+            dfp[proba_col].astype(float),
+            color="purple",
+            alpha=0.50,
+            lw=1.3,
+            label="P(sube)",
+        )
+
+        # shown = set()
+        # for code, (lab, col) in colors.items():
+            # mask = outcome == code
+            # if not mask.any():
+            #     continue
+            # ax1.scatter(
+            #     dfp.loc[mask, date_col],
+            #     dfp.loc[mask, proba_col],
+            #     s=14,
+            #     color=col,
+            #     alpha=0.80,
+            #     edgecolor="none",
+            #     label=lab if lab not in shown else None,
+            #     zorder=4,
+            # )
+            # shown.add(lab)
+
+        ax1.axhline(
+            float(threshold),
+            color="grey",
+            lw=1.0,
+            ls="--",
+            alpha=0.85,
+            label=f"Umbral={float(threshold):.2f}",
+        )
+        ax1.set_ylim(0.0, 1.0)
+        ax1.set_ylabel("Prob.")
+        ax1.legend(loc="upper left", ncol=3, fontsize=9)
+
+    ax1.set_xlabel("Fecha")
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax1.xaxis.set_major_locator(mdates.YearLocator(year_locator))
+
+    ax0.grid(True, alpha=0.25)
+    ax1.grid(True, alpha=0.25)
+
+    fig.suptitle(f"{title}\nAcc={acc:.3f} | BalAcc={bal_acc:.3f}", y=0.98)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
 
 
 BASE = Path(__file__).resolve().parent
@@ -617,7 +777,7 @@ param_dist = {
 # Params base (reutilizables)
 fixed_params_base = dict(
     objective="binary:logistic",
-    n_estimators=5000,
+    n_estimators=200,
     random_state=42,
     tree_method="hist",
     eval_metric="auc",
@@ -857,70 +1017,14 @@ wf_df["signal_raw"] = wf_df["proba_up"]
 wf_df["signal"] = wf_df["proba_up"] - 0.5
 
 # ── Gráfico Walk-Forward: probabilidad vs clase real ──
-fig, ax = plt.subplots(figsize=(14, 5))
-
-ax.plot(
-    wf_df["date"],
-    wf_df["actual"],
-    label="Clase real (0/1)",
-    color="black",
-    alpha=0.6,
-    drawstyle="steps-post",
+thr_wf = float(np.nanmedian(fold_thresholds)) if len(fold_thresholds) else 0.5
+plot_classification_timeline(
+    wf_df,
+    out_path=BASE_DIR / "walk_forward_classification.png",
+    title=f"Walk-Forward — Clasificación {HORIZON}m (aciertos/errores por periodo)",
+    threshold=thr_wf,
+    year_locator=2,
 )
-
-ax.plot(
-    wf_df["date"],
-    wf_df["pred"],
-    label="Predicción clase (0/1)",
-    color="tab:orange",
-    alpha=0.55,
-    drawstyle="steps-post",
-)
-# ax.plot(
-#     wf_df["date"],
-#     wf_df["signal_raw"],
-#     label="P(sube) modelo",
-#     color="purple",
-#     alpha=0.25,
-# )
-
-# Precio en eje secundario para ver confirmación visual
-ax2 = ax.twinx()
-ax2.plot(
-    wf_df["date"],
-    wf_df["close_t"],
-    label="Precio (Close t)",
-    color="tab:blue",
-    alpha=0.5,
-)
-ax2.plot(
-    wf_df["date"],
-    wf_df["close_t_plus_h"],
-    label=f"Precio (Close t+{HORIZON}m)",
-    color="tab:blue",
-    alpha=0.35,
-    linestyle="--",
-)
-ax2.set_ylabel("Precio (Close)")
-ax2.set_yscale("log")
-
-ax.set_title(
-    f"Walk-Forward — Clasificación {HORIZON}m (P(sube)) + Precio (t y t+{HORIZON}m)"
-)
-ax.set_ylabel("Probabilidad / Clase")
-ax.set_ylim(-0.05, 1.05)
-ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-ax.xaxis.set_major_locator(mdates.YearLocator(2))
-fig.autofmt_xdate()
-
-# Leyenda combinada
-lines1, labels1 = ax.get_legend_handles_labels()
-lines2, labels2 = ax2.get_legend_handles_labels()
-ax.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-
-ax.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.savefig(BASE_DIR / "walk_forward_classification.png")
 
 
 # ── Ranking power por deciles de probabilidad ──
@@ -1159,60 +1263,13 @@ else:
         }
     ).sort_values("date")
 
-    fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(
-        roll_plot_df["date"],
-        roll_plot_df["actual"],
-        label="Clase real (0/1)",
-        color="black",
-        alpha=0.6,
-        drawstyle="steps-post",
+    plot_classification_timeline(
+        roll_plot_df,
+        out_path=BASE_DIR / "final_rollout_classification.png",
+        title=f"Final Roll-out — Clasificación {HORIZON}m (aciertos/errores por periodo)",
+        threshold=float(best_thr),
+        year_locator=1,
     )
-
-    ax.plot(
-        roll_plot_df["date"],
-        roll_plot_df["pred"],
-        label="Predicción clase (0/1)",
-        color="tab:orange",
-        alpha=0.55,
-        drawstyle="steps-post",
-    )
-
-    ax2 = ax.twinx()
-    ax2.plot(
-        roll_plot_df["date"],
-        roll_plot_df["close_t"],
-        label="Precio (Close t)",
-        color="tab:blue",
-        alpha=0.5,
-    )
-    ax2.plot(
-        roll_plot_df["date"],
-        roll_plot_df["close_t_plus_h"],
-        label=f"Precio (Close t+{HORIZON}m)",
-        color="tab:blue",
-        alpha=0.35,
-        linestyle="--",
-    )
-    ax2.set_ylabel("Precio (Close)")
-    ax2.set_yscale("log")
-
-    ax.set_title(
-        f"Final Roll-out — Clasificación {HORIZON}m (1 modelo, últimos 4 años) + Precio"
-    )
-    ax.set_ylabel("Probabilidad / Clase")
-    ax.set_ylim(-0.05, 1.05)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.xaxis.set_major_locator(mdates.YearLocator(1))
-    fig.autofmt_xdate()
-
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(BASE_DIR / "final_rollout_classification.png")
 
     # ==============================
     # ROI: Buy&Hold DCA vs Señal (2x cuando pred=1) — Final Roll-out
