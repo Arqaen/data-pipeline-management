@@ -529,13 +529,11 @@ print(df.head())
 # Detecta relación monotónica (no necesariamente lineal)
 # En mercados suele ser más informativo que Pearson
 # =========================================================
-# from scipy.stats import spearmanr
-
-# print("Spearman rank correlation vs target\n")
-
-# for col in features:
-#     rc = spearmanr(df[col], df["target"]).correlation
-#     print(f"{col:35s} {rc:.3f}")
+from scipy.stats import spearmanr
+print("Spearman rank correlation vs target\n")
+for col in features:
+    rc = spearmanr(df[col], df["target"]).correlation
+    print(f"{col:35s} {rc:.3f}")
 # Interpretación:
 # > 0.05 consistente ya es interesante en finanzas
 # Signo estable > magnitud
@@ -546,11 +544,11 @@ print(df.head())
 # Mide si extremos de la variable predicen retornos distintos
 # Es mucho más útil que mirar solo correlación
 # =========================================================
-# feature_to_test = f"cape_earnings_yield"   # cambia si quieres probar otra
-# df["bin"] = pd.qcut(df[feature_to_test], 10, labels=False, duplicates="drop")
-# decile_returns = df.groupby("bin")["target"].mean()
-# print("\nRetorno medio por decil:")
-# print(decile_returns)
+feature_to_test = f"cape_earnings_yield"   # cambia si quieres probar otra
+df["bin"] = pd.qcut(df[feature_to_test], 10, labels=False, duplicates="drop")
+decile_returns = df.groupby("bin")["target"].mean()
+print("\nRetorno medio por decil:")
+print(decile_returns)
 # Interpretación:
 # Ideal: decil 9 >> decil 0
 # Relación creciente casi monotónica = señal robusta
@@ -869,6 +867,15 @@ ax.plot(
     alpha=0.6,
     drawstyle="steps-post",
 )
+
+ax.plot(
+    wf_df["date"],
+    wf_df["pred"],
+    label="Predicción clase (0/1)",
+    color="tab:orange",
+    alpha=0.55,
+    drawstyle="steps-post",
+)
 # ax.plot(
 #     wf_df["date"],
 #     wf_df["signal_raw"],
@@ -998,6 +1005,284 @@ print("Total invertido Señal:", float(sig_curve["invested"].dropna().iloc[-1]))
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ==============================
+# Final roll-out en últimos 10 años
+# ==============================
+FINAL_ROLLOUT_MONTHS = 120
+FINAL_GAP_MONTHS = HORIZON
+
+rollout_end = pd.to_datetime(df.index.max())
+rollout_start = rollout_end - pd.DateOffset(months=FINAL_ROLLOUT_MONTHS - 1)
+rollout_df = df.loc[rollout_start:rollout_end].copy()
+
+train_end_date = rollout_start - pd.DateOffset(months=FINAL_GAP_MONTHS)
+train_df = df.loc[:train_end_date].copy()
+
+if len(rollout_df) < 5 or len(train_df) < (min_train_size // 2):
+    print(
+        "[FinalRollout] No hay suficiente histórico para entrenar/validar "
+        f"(train={len(train_df)} rollout={len(rollout_df)}). Saltando."
+    )
+else:
+    X_train_full = train_df[features]
+    y_train_full = train_df["target"].astype(int)
+
+    X_roll = rollout_df[features]
+    y_roll = rollout_df["target"].astype(int)
+
+    # balanceo opcional (solo si la clase positiva es rara)
+    pos = int((y_train_full == 1).sum())
+    neg = int((y_train_full == 0).sum())
+    scale_pos_weight = (neg / pos) if (pos > 0 and pos < neg) else 1.0
+    if not DO_RANDOM_SEARCH:
+        scale_pos_weight = 1.0
+
+    # ===== Validación interna temporal (igual que walk-forward) =====
+    val_size = int(len(X_train_full) * 0.2)
+    gap = HORIZON
+    tr_end = -(val_size + gap)
+
+    X_tr = X_train_full.iloc[:tr_end]
+    y_tr = y_train_full.iloc[:tr_end]
+    X_val = X_train_full.iloc[-val_size:]
+    y_val = y_train_full.iloc[-val_size:]
+
+    if len(X_val) < 3:
+        X_es = X_val
+        y_es = y_val
+        X_score = X_val
+        y_score = y_val
+    else:
+        score_size = max(1, int(len(X_val) * SCORE_FRAC))
+        es_size = len(X_val) - score_size
+        if es_size < 1:
+            es_size = 1
+            score_size = len(X_val) - 1
+
+        X_es = X_val.iloc[:es_size]
+        y_es = y_val.iloc[:es_size]
+        X_score = X_val.iloc[es_size:]
+        y_score = y_val.iloc[es_size:]
+
+    # ===== Hiperparámetros =====
+    fixed_params = dict(fixed_params_base)
+    manual_params = dict(manual_params_base)
+
+    if not DO_RANDOM_SEARCH:
+        best_params = manual_params
+    else:
+        # Si hubo tuning walk-forward, reutiliza esos params; si no, cae al manual.
+        best_params = best_params_global or manual_params
+
+    model_roll = XGBClassifier(
+        **fixed_params,
+        **best_params,
+        scale_pos_weight=scale_pos_weight,
+    )
+
+    model_roll.fit(
+        X_tr,
+        y_tr,
+        eval_set=[(X_es, y_es)],
+        verbose=False,
+    )
+
+    # ===== Umbral (validación temporal) =====
+    val_proba = model_roll.predict_proba(X_score)[:, 1]
+    thresholds = np.linspace(0.05, 0.95, 91)
+    best_thr = 0.5
+    best_thr_score = -np.inf
+    if len(np.unique(y_score)) > 1:
+        for thr in thresholds:
+            vpred = (val_proba >= thr).astype(int)
+            score = balanced_accuracy_score(y_score, vpred)
+            if score > best_thr_score:
+                best_thr_score = score
+                best_thr = float(thr)
+
+    # ===== Predicción (rollout) =====
+    roll_proba = model_roll.predict_proba(X_roll)[:, 1]
+    roll_pred = (roll_proba >= best_thr).astype(int)
+
+    # ===== Métricas rollout =====
+    roll_acc = float(accuracy_score(y_roll, roll_pred))
+    roll_bal_acc = float(balanced_accuracy_score(y_roll, roll_pred))
+    roll_logloss = float(log_loss(y_roll, roll_proba, labels=[0, 1]))
+    roll_brier = float(brier_score_loss(y_roll, roll_proba))
+    if len(np.unique(y_roll)) > 1:
+        roll_auc = float(roc_auc_score(y_roll, roll_proba))
+        roll_ap = float(average_precision_score(y_roll, roll_proba))
+    else:
+        roll_auc = float("nan")
+        roll_ap = float("nan")
+
+    # Baselines (comparación justa, usando solo train)
+    majority_class = int(y_train_full.mean() >= 0.5)
+    baseline_pred = np.full_like(y_roll.values, fill_value=majority_class)
+    baseline_acc = float(accuracy_score(y_roll, baseline_pred))
+    p0 = float(np.clip(y_train_full.mean(), 1e-6, 1 - 1e-6))
+    baseline_ll = float(log_loss(y_roll, np.full_like(roll_proba, p0), labels=[0, 1]))
+
+    print("\n[FinalRollout] Ventana:", str(rollout_df.index.min().date()), "->", str(rollout_df.index.max().date()))
+    print("[FinalRollout] Train hasta:", str(train_df.index.max().date()), f"(gap={FINAL_GAP_MONTHS}m)")
+    print("[FinalRollout] Umbral elegido:", float(best_thr))
+    print("[FinalRollout] Accuracy:", roll_acc)
+    print("[FinalRollout] Balanced Accuracy:", roll_bal_acc)
+    print("[FinalRollout] ROC-AUC:", roll_auc)
+    print("[FinalRollout] PR-AUC:", roll_ap)
+    print("[FinalRollout] LogLoss:", roll_logloss)
+    print("[FinalRollout] Brier:", roll_brier)
+    print("[FinalRollout] Baseline Accuracy (mayoría train):", baseline_acc)
+    print("[FinalRollout] Baseline LogLoss (p const train):", baseline_ll)
+
+    roll_plot_df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(rollout_df.index),
+            "proba_up": roll_proba,
+            "pred": roll_pred,
+            "actual": y_roll.values,
+            "close_t": rollout_df["Close"].values,
+            "close_t_plus_h": rollout_df["close_fwd"].values,
+        }
+    ).sort_values("date")
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(
+        roll_plot_df["date"],
+        roll_plot_df["actual"],
+        label="Clase real (0/1)",
+        color="black",
+        alpha=0.6,
+        drawstyle="steps-post",
+    )
+
+    ax.plot(
+        roll_plot_df["date"],
+        roll_plot_df["pred"],
+        label="Predicción clase (0/1)",
+        color="tab:orange",
+        alpha=0.55,
+        drawstyle="steps-post",
+    )
+
+    ax2 = ax.twinx()
+    ax2.plot(
+        roll_plot_df["date"],
+        roll_plot_df["close_t"],
+        label="Precio (Close t)",
+        color="tab:blue",
+        alpha=0.5,
+    )
+    ax2.plot(
+        roll_plot_df["date"],
+        roll_plot_df["close_t_plus_h"],
+        label=f"Precio (Close t+{HORIZON}m)",
+        color="tab:blue",
+        alpha=0.35,
+        linestyle="--",
+    )
+    ax2.set_ylabel("Precio (Close)")
+    ax2.set_yscale("log")
+
+    ax.set_title(
+        f"Final Roll-out — Clasificación {HORIZON}m (1 modelo, últimos 4 años) + Precio"
+    )
+    ax.set_ylabel("Probabilidad / Clase")
+    ax.set_ylim(-0.05, 1.05)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.xaxis.set_major_locator(mdates.YearLocator(1))
+    fig.autofmt_xdate()
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(BASE_DIR / "final_rollout_classification.png")
+
+    # ==============================
+    # ROI: Buy&Hold DCA vs Señal (2x cuando pred=1) — Final Roll-out
+    # ==============================
+    roll_signal = roll_plot_df[["date", "pred"]].copy()
+    roll_signal["date"] = pd.to_datetime(roll_signal["date"])
+    roll_signal = roll_signal.set_index("date").sort_index()
+
+    prices_eval_roll = pd.Series(
+        roll_plot_df["close_t"].values,
+        index=pd.to_datetime(roll_plot_df["date"]),
+        name="Close",
+    ).sort_index()
+
+    pred_aligned_roll = roll_signal["pred"].reindex(prices_eval_roll.index)
+
+    # Comparación justa: usar SOLO los meses con predicción.
+    has_pred_roll = pred_aligned_roll.notna()
+    prices_eval_roll = prices_eval_roll.loc[has_pred_roll]
+    pred_aligned_roll = pred_aligned_roll.loc[has_pred_roll]
+
+    contrib_bh_roll = pd.Series(monthly_amount, index=prices_eval_roll.index)
+    contrib_signal_roll = pd.Series(0.0, index=prices_eval_roll.index)
+    contrib_signal_roll[pred_aligned_roll.fillna(0).astype(int) == 1] = monthly_amount * signal_multiplier
+
+    bh_curve_roll = simulate_monthly_dca_roi(prices_eval_roll, contrib_bh_roll)
+    sig_curve_roll = simulate_monthly_dca_roi(prices_eval_roll, contrib_signal_roll)
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(
+        bh_curve_roll.index,
+        bh_curve_roll["roi_pct"],
+        label=f"Buy&Hold DCA (x={monthly_amount:g}/mes)",
+        color="tab:blue",
+    )
+    ax.plot(
+        sig_curve_roll.index,
+        sig_curve_roll["roi_pct"],
+        label=f"Señal (comprar {signal_multiplier:g}x si pred=1)",
+        color="purple",
+    )
+
+    ax.axhline(0, linestyle="--", color="grey", alpha=0.6)
+    ax.set_title(f"ROI acumulado (%) — DCA mensual vs Señal (Final Roll-out, horizonte {HORIZON}m)")
+    ax.set_ylabel("ROI (%)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.xaxis.set_major_locator(mdates.YearLocator(1))
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+    plt.tight_layout()
+    plt.savefig(BASE_DIR / "roi_strategies_final_rollout.png")
+
+    print("\n[FinalRollout ROI] ROI final Buy&Hold DCA (%):", float(bh_curve_roll["roi_pct"].dropna().iloc[-1]))
+    print("[FinalRollout ROI] ROI final Señal 2x si pred=1 (%):", float(sig_curve_roll["roi_pct"].dropna().iloc[-1]))
+    print("[FinalRollout ROI] Total invertido Buy&Hold:", float(bh_curve_roll["invested"].dropna().iloc[-1]))
+    print("[FinalRollout ROI] Total invertido Señal:", float(sig_curve_roll["invested"].dropna().iloc[-1]))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ===== Modelo final entrenado en todo el dataset =====
 final_fixed_params = dict(
     objective="binary:logistic",
@@ -1028,6 +1313,37 @@ print("Última fecha:", X.index[-1])
 print(f"P(sube) en {HORIZON} meses:", final_proba)
 print("Predicción clase (>=0.5):", final_pred)
 
+# ===== Métricas (in-sample, sobre todo el dataset) =====
+final_proba_all = final_model.predict_proba(X)[:, 1]
+final_pred_all = (final_proba_all >= 0.5).astype(int)
+
+final_acc = float(accuracy_score(y, final_pred_all))
+final_bal_acc = float(balanced_accuracy_score(y, final_pred_all))
+final_logloss = float(log_loss(y, final_proba_all, labels=[0, 1]))
+final_brier = float(brier_score_loss(y, final_proba_all))
+if len(np.unique(y)) > 1:
+    final_auc = float(roc_auc_score(y, final_proba_all))
+    final_ap = float(average_precision_score(y, final_proba_all))
+else:
+    final_auc = float("nan")
+    final_ap = float("nan")
+
+# Baselines (comparación justa)
+majority_class = int(y.mean() >= 0.5)
+baseline_pred = np.full_like(y.values, fill_value=majority_class)
+baseline_acc = float(accuracy_score(y, baseline_pred))
+p0 = float(np.clip(y.mean(), 1e-6, 1 - 1e-6))
+baseline_ll = float(log_loss(y, np.full_like(final_proba_all, p0), labels=[0, 1]))
+
+print("\n[FinalModel] Accuracy:", final_acc)
+print("[FinalModel] Balanced Accuracy:", final_bal_acc)
+print("[FinalModel] ROC-AUC:", final_auc)
+print("[FinalModel] PR-AUC:", final_ap)
+print("[FinalModel] LogLoss:", final_logloss)
+print("[FinalModel] Brier:", final_brier)
+print("[FinalModel] Baseline Accuracy (mayoría train):", baseline_acc)
+print("[FinalModel] Baseline LogLoss (p const train):", baseline_ll)
+
 # ==============================
 # SHAP (clasificación binaria)
 # ==============================
@@ -1052,12 +1368,31 @@ shap.summary_plot(shap_values_pos, X, plot_type="bar", show=False)
 plt.tight_layout()
 plt.savefig(BASE_DIR / "shap_importance_bar_cls.png")
 
-for feature in X.columns:
-    plt.figure()
-    shap.dependence_plot(feature, shap_values_pos, X, show=False)
+top_features = [
+    "m2_yoy",
+    "permit_yoy",
+    "equity_risk_premium",
+    "sp500_earnings_yield",
+    "HOUST",
+    "unemp_change_12m",
+    "gdp_yoy_lag6"
+]
+
+for feature in top_features:
+    plt.figure(figsize=(6, 4))
+    
+    shap.dependence_plot(
+        feature,
+        shap_values_pos,  
+        X,
+        interaction_index="auto",  # muestra interacción automáticamente
+        show=False
+    )
+    
     fname = f"shap_dependence_cls_{feature}.png"
     plt.tight_layout()
-    plt.savefig(BASE_DIR / fname)
+    plt.savefig(BASE_DIR / fname, dpi=120)
+    plt.close()
 
 # SHAP para la última predicción (clase positiva)
 shap_values_last = explainer.shap_values(last_X)
