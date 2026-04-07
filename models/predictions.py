@@ -24,6 +24,128 @@ from sklearn.metrics import (
 )
 
 
+def top_k_signals(
+    proba: np.ndarray,
+    *,
+    k_frac: float,
+    min_k: int = 1,
+) -> np.ndarray:
+    """Devuelve señales binarias seleccionando exactamente las K probas más altas.
+
+    - Controla nº de trades (K) por bloque.
+    - Robustez: evita dependencia fuerte de calibración absoluta (umbral).
+
+    Args:
+        proba: array-like de probabilidades.
+        k_frac: fracción objetivo a seleccionar (0..1).
+        min_k: mínimo absoluto de selecciones (capado por n).
+
+    Returns:
+        np.ndarray de shape (n,) con 0/1.
+    """
+
+    proba = np.asarray(proba, dtype=float)
+    if not np.all(np.isfinite(proba)):
+        proba = np.nan_to_num(proba, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
+    n = int(proba.size)
+    if n == 0:
+        return np.asarray([], dtype=int)
+
+    k_frac = float(np.clip(k_frac, 0.0, 1.0))
+    min_k = int(max(0, min_k))
+
+    k = int(n * k_frac)
+    k = max(k, min_k)
+    k = int(np.clip(k, 0, n))
+    if k == 0:
+        return np.zeros(n, dtype=int)
+
+    # Orden descendente; mergesort es estable (útil si hay empates).
+    idx_sorted = np.argsort(-proba, kind="mergesort")
+    top_idx = idx_sorted[:k]
+
+    signals = np.zeros(n, dtype=int)
+    signals[top_idx] = 1
+    return signals
+
+
+def top_k_cutoff(proba: np.ndarray, *, k: int) -> float:
+    """Umbral equivalente (k-ésimo mayor) para reportes/plots.
+
+    Nota: seleccionar por top-k NO es lo mismo que aplicar un umbral fijo,
+    pero este cutoff ayuda a visualizar el punto de corte del bloque.
+    """
+
+    proba = np.asarray(proba, dtype=float)
+    if not np.all(np.isfinite(proba)):
+        proba = np.nan_to_num(proba, nan=-np.inf, posinf=-np.inf, neginf=-np.inf)
+    n = int(proba.size)
+    if n == 0:
+        return 0.5
+
+    k = int(np.clip(int(k), 1, n))
+    # kth mayor => (n-k)th menor
+    cutoff = float(np.partition(proba, n - k)[n - k])
+    return cutoff
+
+
+def choose_threshold(
+    y_score: pd.Series,
+    val_proba: np.ndarray,
+    *,
+    method: str,
+    base_rate_train: float,
+) -> Tuple[float, float]:
+    """Elige un umbral de clasificación usando SOLO el bloque de scoring.
+
+    Métodos:
+    - "balanced_accuracy": maximiza balanced accuracy (tu comportamiento actual)
+    - "fixed_0.5": umbral 0.5 (neutral si las probabilidades están calibradas)
+    - "prevalence_match": fuerza %pred=1 ~ base_rate del train (neutral a exposición)
+    - "youden_j": maximiza TPR - FPR (ROC, simétrico en errores)
+    """
+
+    val_proba = np.asarray(val_proba, dtype=float)
+    val_proba = np.clip(val_proba, 1e-9, 1 - 1e-9)
+    y_arr = np.asarray(y_score, dtype=int)
+
+    if method == "fixed_0.5":
+        return 0.5, float("nan")
+
+    if method == "prevalence_match":
+        br = float(np.clip(base_rate_train, 1e-6, 1 - 1e-6))
+        # Queremos pred=1 en ~br de los casos -> umbral = cuantil (1-br)
+        thr = float(np.quantile(val_proba, 1.0 - br))
+        return thr, br
+
+    # Si solo hay una clase en el bloque, no hay ROC/BA informativos.
+    if len(np.unique(y_arr)) < 2:
+        return 0.5, float("nan")
+
+    if method == "youden_j":
+        fpr, tpr, thr = roc_curve(y_arr, val_proba)
+        thr = np.asarray(thr, dtype=float)
+        mask = np.isfinite(thr)
+        if not np.any(mask):
+            return 0.5, float("nan")
+        j = (tpr - fpr)[mask]
+        i = int(np.nanargmax(j))
+        thr_best = float(thr[mask][i])
+        return thr_best, float(j[i])
+
+    # default: balanced_accuracy
+    thresholds = np.linspace(0.05, 0.95, 91)
+    best_thr = 0.5
+    best_score = -np.inf
+    for thr in thresholds:
+        vpred = (val_proba >= float(thr)).astype(int)
+        score = balanced_accuracy_score(y_arr, vpred)
+        if score > best_score:
+            best_score = float(score)
+            best_thr = float(thr)
+    return best_thr, float(best_score)
+
+
 def _sample_param_combo(param_dist: Dict[str, List], rng: np.random.RandomState) -> Dict:
     return {key: rng.choice(values) for key, values in param_dist.items()}
 
@@ -44,9 +166,9 @@ def tune_xgb_random_search_timeval(
     """Random search con validación temporal (X_tr -> early-stopping -> scoring).
 
     - Sin RandomizedSearchCV (que no encaja bien con early_stopping + embargo).
-    - Score: maximiza ROC-AUC en el bloque de scoring.
+    - Score: minimiza LogLoss en el bloque de scoring.
 
-    Devuelve: (best_params, best_score)
+    Devuelve: (best_params, best_logloss)
 
     Nota: `n_estimators` NO se optimiza aquí. Se asume fijo en `fixed_params`
     (early-stopping puede cortar antes, pero no devolvemos/ajustamos un
@@ -55,18 +177,19 @@ def tune_xgb_random_search_timeval(
     rng = np.random.RandomState(random_state)
 
     best_params: Dict = {}
-    best_score = -np.inf
+    best_logloss = np.inf
     fixed_n_estimators = int(fixed_params.get("n_estimators", 5000))
 
     # Si no hay suficientes clases, log_loss sigue siendo válido con labels=[0,1]
     # pero el tuning puede ser poco informativo. Aun así, lo dejamos correr.
     for _ in range(int(n_iter)):
         params = _sample_param_combo(param_dist, rng)
-        model = XGBClassifier(
-            **fixed_params,
-            **params,
-            scale_pos_weight=scale_pos_weight,
-        )
+        # Importante: no podemos pasar claves duplicadas vía múltiples **kwargs.
+        # Mezclamos para que params (random search) sobrescriba a fixed_params.
+        model_params = dict(fixed_params)
+        model_params.update(params)
+        model_params["scale_pos_weight"] = scale_pos_weight
+        model = XGBClassifier(**model_params)
         model.fit(
             X_tr,
             y_tr,
@@ -75,21 +198,20 @@ def tune_xgb_random_search_timeval(
         )
         score_proba = model.predict_proba(X_score)[:, 1]
 
-        if len(np.unique(y_score)) > 1:
-            score = float(roc_auc_score(y_score, score_proba))
-        else:
-            # ROC-AUC no definido con una sola clase; fallback a -logloss para poder comparar.
-            score = -float(log_loss(y_score, score_proba, labels=[0, 1]))
+        # Optimizamos LogLoss directamente (más estable que AUC con base-rate alta).
+        # Clampeamos para evitar inf por probabilidades 0/1.
+        score_proba = np.clip(score_proba, 1e-6, 1 - 1e-6)
+        ll = float(log_loss(y_score, score_proba, labels=[0, 1]))
 
-        if score > best_score:
-            best_score = score
+        if ll < best_logloss:
+            best_logloss = ll
             best_params = params
 
     print(
-        f"[RandomSearch] best score={best_score:.5f} "
+        f"[RandomSearch] best logloss={best_logloss:.5f} "
         f"n_estimators(fijo)={fixed_n_estimators} params={best_params}"
     )
-    return best_params, float(best_score)
+    return best_params, float(best_logloss)
 
 def simulate_monthly_dca_roi(
     prices: pd.Series,
@@ -308,18 +430,8 @@ def plot_classification_timeline(
     y_true = dfp[actual_col].astype(int).to_numpy()
     y_pred = dfp[pred_col].astype(int).to_numpy()
 
-    # Outcome codes: 0 TN, 1 FP, 2 FN, 3 TP
-    outcome = np.zeros_like(y_true)
-    outcome[(y_true == 0) & (y_pred == 1)] = 1
-    outcome[(y_true == 1) & (y_pred == 0)] = 2
-    outcome[(y_true == 1) & (y_pred == 1)] = 3
-
-    colors = {
-        0: ("TN", "tab:blue"),
-        1: ("TP", "tab:green"),
-        2: ("FP", "tab:red"),
-        3: ("FN", "tab:orange"),
-    }
+    # Fondo binario: verde si acierta (TP+TN), rojo si falla (FP+FN)
+    is_correct = (y_true == y_pred)
 
     acc = float(accuracy_score(y_true, y_pred))
     bal_acc = float(balanced_accuracy_score(y_true, y_pred))
@@ -333,7 +445,7 @@ def plot_classification_timeline(
     )
 
     for i in range(len(dfp)):
-        _, col = colors[int(outcome[i])]
+        col = "tab:green" if bool(is_correct[i]) else "tab:red"
         ax0.axvspan(dfp.loc[i, date_col], ends.iloc[i], color=col, alpha=0.10, lw=0)
 
     # ax0.plot(
@@ -384,10 +496,10 @@ def plot_classification_timeline(
     ax0b.set_ylabel("Precio (Close)")
     ax0b.set_yscale("log")
 
-    # Leyenda: incluye el mapa de colores TN/FP/FN/TP (para el fondo)
+    # Leyenda: solo 2 categorías para el fondo (sin desglose TN/TP/FP/FN)
     outcome_handles = [
-        Patch(facecolor=col, edgecolor="none", alpha=0.25, label=lab)
-        for _, (lab, col) in colors.items()
+        Patch(facecolor="tab:green", edgecolor="none", alpha=0.25, label="Verde (TP+TN)"),
+        Patch(facecolor="tab:red", edgecolor="none", alpha=0.25, label="Rojo (FP+FN)"),
     ]
 
     lines0, labels0 = ax0.get_legend_handles_labels()
@@ -1393,9 +1505,20 @@ print(f"Target base-rate (P(y=1)) en dataset: {base_rate:.3f}")
 # =============================
 DO_RANDOM_SEARCH = False
 TUNE_EACH_FOLD = False  # True = tunear en cada ventana; False = tunear 1 vez y reutilizar
-RANDOM_SEARCH_N_ITER = 200
+RANDOM_SEARCH_N_ITER = 300
 RANDOM_SEARCH_SEED = 42
 SCORE_FRAC = 0.5  # fracción del bloque de validación reservada para scoring (ROC-AUC) + umbral
+
+# Umbral "neutral" por defecto: mantiene tasa de señales ~ base-rate del train.
+# Alternativas: "fixed_0.5", "youden_j", "balanced_accuracy", "top_k".
+THRESHOLD_METHOD = "top_k"
+
+# TOP-K: en vez de umbral fijo, seleccionar las K mejores oportunidades.
+# Para evitar overfitting, no se "tunea" k por fold.
+# - Si TOP_K_FRAC=None, se usa la prevalencia del train (base-rate) como k_frac.
+# - TOP_K_MIN_K garantiza un mínimo de trades por bloque.
+TOP_K_FRAC: Optional[float] = None
+TOP_K_MIN_K = 1
 
 param_dist = {
     "learning_rate": [0.03, 0.05, 0.07],
@@ -1409,22 +1532,26 @@ param_dist = {
 # Params base (reutilizables)
 fixed_params_base = dict(
     objective="binary:logistic",
-    n_estimators=200,
+    # Dejar alto para que early-stopping tenga margen real
+    n_estimators=5000,
     random_state=42,
     tree_method="hist",
-    eval_metric="auc",
-    early_stopping_rounds=200,
+    eval_metric="logloss",
+    early_stopping_rounds=100,
     subsample=0.9,
     colsample_bytree=0.8,
 )
 
 manual_params_base = dict(
-    learning_rate=0.05,
-    max_depth=5,
-    min_child_weight=5,
-    gamma=1.0,
-    reg_alpha=0.1,
-    reg_lambda=10,
+    learning_rate=0.07,
+    max_depth=1,
+    min_child_weight=8,
+    gamma=0.0,
+    subsample=1.0,
+    colsample_bytree=1.0,
+    reg_lambda=8,
+    reg_alpha=0.05,
+    max_delta_step=1,
 )
 
 best_params_global: Optional[Dict] = None
@@ -1457,6 +1584,7 @@ while start < len(df) - test_size:
 
     purge = HORIZON
     embargo = HORIZON
+    embargo = 0
 
     train_end = start - purge
     test_end = start + test_size
@@ -1548,11 +1676,11 @@ while start < len(df) - test_size:
 
 
     # ===== Entrenar modelo =====
-    model = XGBClassifier(
-        **fold_fixed_params,
-        **best_params,
-        scale_pos_weight=scale_pos_weight,
-    )
+    # Importante: evitar claves duplicadas (p.ej. subsample/colsample) entre fixed y best_params.
+    model_params = dict(fold_fixed_params)
+    model_params.update(best_params)
+    model_params["scale_pos_weight"] = scale_pos_weight
+    model = XGBClassifier(**model_params)
 
     model.fit(
         X_tr,
@@ -1566,22 +1694,28 @@ while start < len(df) - test_size:
     # Probabilidades
     proba = model.predict_proba(X_test)[:, 1]
 
-    # ===== Selección de umbral (en validación temporal) =====
-    # Nota: 0.5 rara vez es óptimo si la base-rate != 0.5.
-    val_proba = model.predict_proba(X_score)[:, 1]
-    thresholds = np.linspace(0.05, 0.95, 91)
-    best_thr = 0.5
-    best_score = -np.inf
-    if len(np.unique(y_score)) > 1:
-        for thr in thresholds:
-            vpred = (val_proba >= thr).astype(int)
-            score = balanced_accuracy_score(y_score, vpred)
-            if score > best_score:
-                best_score = score
-                best_thr = float(thr)
+    # ===== Regla de decisión: threshold vs TOP-K =====
+    if THRESHOLD_METHOD == "top_k":
+        k_frac = TOP_K_FRAC
+        if k_frac is None:
+            k_frac = float(np.clip(y_train.mean(), 0.0, 1.0))
 
-    fold_thresholds.append(best_thr)
-    pred = (proba >= best_thr).astype(int)
+        pred = top_k_signals(proba, k_frac=float(k_frac), min_k=int(TOP_K_MIN_K))
+        cutoff = top_k_cutoff(proba, k=int(pred.sum()))
+        fold_thresholds.append(float(cutoff))
+    else:
+        # ===== Selección de umbral (en validación temporal) =====
+        # Nota: 0.5 rara vez es óptimo si la base-rate != 0.5.
+        val_proba = model.predict_proba(X_score)[:, 1]
+        best_thr, _thr_aux = choose_threshold(
+            y_score,
+            val_proba,
+            method=THRESHOLD_METHOD,
+            base_rate_train=float(y_train.mean()),
+        )
+
+        fold_thresholds.append(float(best_thr))
+        pred = (proba >= float(best_thr)).astype(int)
 
     all_proba.extend(proba.tolist())
     all_pred.extend(pred.tolist())
@@ -1936,22 +2070,27 @@ else:
         verbose=False,
     )
 
-    # ===== Umbral (validación temporal) =====
-    val_proba = model_roll.predict_proba(X_score)[:, 1]
-    thresholds = np.linspace(0.05, 0.95, 91)
-    best_thr = 0.5
-    best_thr_score = -np.inf
-    if len(np.unique(y_score)) > 1:
-        for thr in thresholds:
-            vpred = (val_proba >= thr).astype(int)
-            score = balanced_accuracy_score(y_score, vpred)
-            if score > best_thr_score:
-                best_thr_score = score
-                best_thr = float(thr)
-
     # ===== Predicción (rollout) =====
     roll_proba = model_roll.predict_proba(X_roll)[:, 1]
-    roll_pred = (roll_proba >= best_thr).astype(int)
+
+    if THRESHOLD_METHOD == "top_k":
+        k_frac = TOP_K_FRAC
+        if k_frac is None:
+            k_frac = float(np.clip(y_train_full.mean(), 0.0, 1.0))
+
+        roll_pred = top_k_signals(roll_proba, k_frac=float(k_frac), min_k=int(TOP_K_MIN_K))
+        best_thr = top_k_cutoff(roll_proba, k=int(roll_pred.sum()))
+    else:
+        # ===== Umbral (validación temporal) =====
+        val_proba = model_roll.predict_proba(X_score)[:, 1]
+        best_thr, _thr_aux = choose_threshold(
+            y_score,
+            val_proba,
+            method=THRESHOLD_METHOD,
+            base_rate_train=float(y_train_full.mean()),
+        )
+
+        roll_pred = (roll_proba >= float(best_thr)).astype(int)
 
     # ===== Métricas rollout =====
     roll_acc = float(accuracy_score(y_roll, roll_pred))
