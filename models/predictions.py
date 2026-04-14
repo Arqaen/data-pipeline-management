@@ -1520,77 +1520,80 @@ while start < len(df) - test_size:
 
 
 
-    # ===== Random Search (opcional) =====
-    fixed_params = dict(fixed_params_base)
-    manual_params = dict(manual_params_base)
-
-    if not DO_RANDOM_SEARCH:
-        best_params = manual_params
-    elif DO_RANDOM_SEARCH and (TUNE_EACH_FOLD or best_params_global is None):
-        # Nota: el tuning usa solo (X_tr -> X_val). No toca el test.
-        best_params, _best_val_score = tune_xgb_random_search_timeval(
-            X_tr,
-            y_tr,
-            X_es,
-            y_es,
-            X_score,
-            y_score,
-            fixed_params=fixed_params,
-            param_dist=param_dist,
-            n_iter=RANDOM_SEARCH_N_ITER,
-            random_state=RANDOM_SEARCH_SEED,
-        )
-        if not TUNE_EACH_FOLD:
-            best_params_global = best_params
-    else:
-        best_params = best_params_global or {}
-
-    # print(f"[Fold] usando best_params={best_params} ")
-    fold_fixed_params = dict(fixed_params)
-
-
-
-
-
-
-
-    # ===== Entrenar modelo =====
-    # Importante: evitar claves duplicadas (p.ej. subsample/colsample) entre fixed y best_params.
-    model_params = dict(fold_fixed_params)
-    model_params.update(best_params)
-
-    model = XGBClassifier(**model_params)
-    # ===== CHECK: evitar validation inválida =====
-    if len(np.unique(y_es)) < 2:
-        model.set_params(early_stopping_rounds=None)
-        model.fit(
-            X_tr,
-            y_tr,
-            verbose=False,
-        )
-    else:
-        model.fit(
-            X_tr,
-            y_tr,
-            eval_set=[(X_es, y_es)],
-            verbose=False,
-        )
-    last_model = model
-
-    # ===== Threshold óptimo en validation (para F1) =====
-    if len(X_score) < 1:
+    if len(np.unique(y_tr)) < 2:
+        # XGBoost no puede entrenar clasificación binaria con una sola clase.
+        # En esos folds usamos un predictor constante basado solo en el train disponible.
         best_t, _best_f1 = 0.5, float("nan")
+        p_const = float(np.clip(y_tr.mean(), 1e-6, 1.0 - 1e-6))
+        proba = np.full(len(X_test), p_const, dtype=float)
+        y_pred = (proba >= best_t).astype(int)
     else:
-        score_proba = model.predict_proba(X_score)[:, 1]
-        best_t, _best_f1 = _best_threshold_by_f1(y_score, score_proba)
+        # ===== Random Search (opcional) =====
+        fixed_params = dict(fixed_params_base)
+        manual_params = dict(manual_params_base)
+
+        if not DO_RANDOM_SEARCH:
+            best_params = manual_params
+        elif DO_RANDOM_SEARCH and (TUNE_EACH_FOLD or best_params_global is None):
+            # Nota: el tuning usa solo (X_tr -> X_val). No toca el test.
+            best_params, _best_val_score = tune_xgb_random_search_timeval(
+                X_tr,
+                y_tr,
+                X_es,
+                y_es,
+                X_score,
+                y_score,
+                fixed_params=fixed_params,
+                param_dist=param_dist,
+                n_iter=RANDOM_SEARCH_N_ITER,
+                random_state=RANDOM_SEARCH_SEED,
+            )
+            if not TUNE_EACH_FOLD:
+                best_params_global = best_params
+        else:
+            best_params = best_params_global or {}
+
+        # print(f"[Fold] usando best_params={best_params} ")
+        fold_fixed_params = dict(fixed_params)
+
+        # ===== Entrenar modelo =====
+        # Importante: evitar claves duplicadas (p.ej. subsample/colsample) entre fixed y best_params.
+        model_params = dict(fold_fixed_params)
+        model_params.update(best_params)
+
+        model = XGBClassifier(**model_params)
+        # ===== CHECK: evitar validation inválida =====
+        if len(np.unique(y_es)) < 2:
+            model.set_params(early_stopping_rounds=None)
+            model.fit(
+                X_tr,
+                y_tr,
+                verbose=False,
+            )
+        else:
+            model.fit(
+                X_tr,
+                y_tr,
+                eval_set=[(X_es, y_es)],
+                verbose=False,
+            )
+        last_model = model
+
+        # ===== Threshold óptimo en validation (para F1) =====
+        if len(X_score) < 1:
+            best_t, _best_f1 = 0.5, float("nan")
+        else:
+            score_proba = model.predict_proba(X_score)[:, 1]
+            best_t, _best_f1 = _best_threshold_by_f1(y_score, score_proba)
+
+        # Probabilidades
+        proba = model.predict_proba(X_test)[:, 1]
+        # proba = 1 - proba
+
+        # Predicción de clase usando threshold optimizado (NO 0.5 fijo)
+        y_pred = (proba >= best_t).astype(int)
+
     all_thresholds.append(float(best_t))
-
-    # Probabilidades
-    proba = model.predict_proba(X_test)[:, 1]
-    # proba = 1 - proba
-
-    # Predicción de clase usando threshold optimizado (NO 0.5 fijo)
-    y_pred = (proba >= best_t).astype(int)
 
     all_proba.extend(proba.tolist())
     all_actuals.extend(y_test.values.tolist())
@@ -1904,7 +1907,7 @@ print("ROI final Señal (clase) (%):", float(sig_curve["roi_pct"].dropna().iloc[
 
 
 
-exit(0)
+# exit(0)
 
 # ==============================
 # Final roll-out en últimos 10 años
@@ -1958,38 +1961,53 @@ else:
         X_score = X_val.iloc[es_size:]
         y_score = y_val.iloc[es_size:]
 
-    # ===== Hiperparámetros =====
-    fixed_params = dict(fixed_params_base)
-    manual_params = dict(manual_params_base)
-
-    if not DO_RANDOM_SEARCH:
-        best_params = manual_params
-    else:
-        # Si hubo tuning walk-forward, reutiliza esos params; si no, cae al manual.
-        best_params = best_params_global or manual_params
-
-    model_params = dict(fixed_params)
-    model_params.update(best_params)
-
-    model_roll = XGBClassifier(**model_params)
-
-    model_roll.fit(
-        X_tr,
-        y_tr,
-        eval_set=[(X_es, y_es)],
-        verbose=False,
-    )
-
-    # ===== Threshold óptimo (rollout) =====
-    if len(X_score) < 1:
+    if len(np.unique(y_tr)) < 2:
+        # Mismo fallback que en walk-forward: sin ambas clases, no hay modelo XGB válido.
         best_t_roll, _best_f1_roll = 0.5, float("nan")
+        p_const = float(np.clip(y_tr.mean(), 1e-6, 1.0 - 1e-6))
+        roll_proba = np.full(len(X_roll), p_const, dtype=float)
+        roll_pred = (roll_proba >= best_t_roll).astype(int)
     else:
-        score_proba = model_roll.predict_proba(X_score)[:, 1]
-        best_t_roll, _best_f1_roll = _best_threshold_by_f1(y_score, score_proba)
+        # ===== Hiperparámetros =====
+        fixed_params = dict(fixed_params_base)
+        manual_params = dict(manual_params_base)
 
-    # ===== Predicción (rollout) =====
-    roll_proba = model_roll.predict_proba(X_roll)[:, 1]
-    roll_pred = (roll_proba >= best_t_roll).astype(int)
+        if not DO_RANDOM_SEARCH:
+            best_params = manual_params
+        else:
+            # Si hubo tuning walk-forward, reutiliza esos params; si no, cae al manual.
+            best_params = best_params_global or manual_params
+
+        model_params = dict(fixed_params)
+        model_params.update(best_params)
+
+        model_roll = XGBClassifier(**model_params)
+
+        if len(np.unique(y_es)) < 2:
+            model_roll.set_params(early_stopping_rounds=None)
+            model_roll.fit(
+                X_tr,
+                y_tr,
+                verbose=False,
+            )
+        else:
+            model_roll.fit(
+                X_tr,
+                y_tr,
+                eval_set=[(X_es, y_es)],
+                verbose=False,
+            )
+
+        # ===== Threshold óptimo (rollout) =====
+        if len(X_score) < 1:
+            best_t_roll, _best_f1_roll = 0.5, float("nan")
+        else:
+            score_proba = model_roll.predict_proba(X_score)[:, 1]
+            best_t_roll, _best_f1_roll = _best_threshold_by_f1(y_score, score_proba)
+
+        # ===== Predicción (rollout) =====
+        roll_proba = model_roll.predict_proba(X_roll)[:, 1]
+        roll_pred = (roll_proba >= best_t_roll).astype(int)
 
     # ===== Métricas rollout =====
     roll_logloss = float(_binary_logloss(y_roll.values, roll_proba))
