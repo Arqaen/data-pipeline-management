@@ -91,13 +91,15 @@ def tune_xgb_random_search_timeval(
         # Mezclamos para que params (random search) sobrescriba a fixed_params.
         model_params = dict(fixed_params)
         model_params.update(params)
+        early_stopping_rounds = model_params.pop("early_stopping_rounds", 100)
+        early_stopping_rounds = None if early_stopping_rounds is None else int(early_stopping_rounds)
         model = XGBClassifier(**model_params)
         model.fit(
             X_tr,
             y_tr,
             eval_set=[(X_es, y_es)],
             verbose=False,
-            early_stopping_rounds=model_params.get("early_stopping_rounds", 100),
+            early_stopping_rounds=early_stopping_rounds,
         )
         score_proba = model.predict_proba(X_score)[:, 1]
 
@@ -1171,8 +1173,8 @@ features = valid_features
 print( "features con suficiente historia:", features)
 
 # TARGET  
-min_train_size = 20*HORIZON   
-test_size = HORIZON 
+min_train_size = 240
+test_size = 12 
 close_fwd = df["Close"].shift(-HORIZON)
 df["close_fwd"] = close_fwd
 df["future_return"] = close_fwd / df["Close"] - 1
@@ -1503,6 +1505,9 @@ while start < len(df) - test_size:
     model_params = dict(fold_fixed_params)
     model_params.update(best_params)
 
+    early_stopping_rounds = model_params.pop("early_stopping_rounds", 100)
+    early_stopping_rounds = None if early_stopping_rounds is None else int(early_stopping_rounds)
+
     model = XGBClassifier(**model_params)
     # ===== CHECK: evitar validation inválida =====
     if len(np.unique(y_es)) < 2:
@@ -1776,8 +1781,8 @@ plt.savefig(BASE_DIR / "roi_strategies_walk_forward.png")
 
 print("\nROI final Buy&Hold DCA (%):", float(bh_curve["roi_pct"].dropna().iloc[-1]))
 print("ROI final Señal (proba) (%):", float(sig_curve["roi_pct"].dropna().iloc[-1]))
-print("Total invertido Buy&Hold:", float(bh_curve["invested"].dropna().iloc[-1]))
-print("Total invertido Señal:", float(sig_curve["invested"].dropna().iloc[-1]))
+# print("Total invertido Buy&Hold:", float(bh_curve["invested"].dropna().iloc[-1]))
+# print("Total invertido Señal:", float(sig_curve["invested"].dropna().iloc[-1]))
 
 
 
