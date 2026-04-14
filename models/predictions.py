@@ -114,6 +114,53 @@ def _confusion_matrix_by_thresholds(
     return pd.DataFrame(rows).set_index("threshold")
 
 
+def plot_confusion_matrix_heatmap(
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    *,
+    out_path: Path,
+    title: str,
+) -> None:
+    y_arr = np.asarray(y_true, dtype=int)
+    y_hat = np.asarray(y_pred, dtype=int)
+    if y_arr.size == 0 or y_hat.size == 0:
+        return
+    if y_arr.size != y_hat.size:
+        return
+
+    cm = confusion_matrix(y_arr, y_hat, labels=[0, 1])
+    if cm.shape != (2, 2):
+        return
+    tn, fp, fn, tp = cm.ravel()
+
+    mat = np.array([[tn, fp], [fn, tp]], dtype=float)
+    vmax = float(np.max(mat)) if np.isfinite(mat).any() else 1.0
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.4))
+    im = ax.imshow(mat, cmap="Blues", vmin=0.0, vmax=max(1.0, vmax))
+
+    ax.set_xticks([0, 1], labels=["Pred 0", "Pred 1"])
+    ax.set_yticks([0, 1], labels=["Real 0", "Real 1"])
+    ax.set_xlabel("Predicción")
+    ax.set_ylabel("Real")
+    ax.set_title(title)
+
+    labels = np.array([["TN", "FP"], ["FN", "TP"]], dtype=object)
+    for i in range(2):
+        for j in range(2):
+            val = int(mat[i, j])
+            txt = f"{labels[i, j]}\n{val}"  # solo etiqueta + count
+            color = "white" if (vmax > 0 and mat[i, j] / vmax > 0.55) else "black"
+            ax.text(j, i, txt, ha="center", va="center", fontsize=14, color=color, fontweight="bold")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Conteo")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def _sample_param_combo(param_dist: Dict[str, List], rng: np.random.RandomState) -> Dict:
     return {key: rng.choice(values) for key, values in param_dist.items()}
 
@@ -763,6 +810,313 @@ def plot_rolling_logloss_wf(
     plt.close(fig)
 
 
+def plot_rolling_brier_wf(
+    wf_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    window: int = 36,
+    date_col: str = "date",
+    actual_col: str = "actual",
+    proba_col: str = "proba_up",
+) -> None:
+    dfp = wf_df[[date_col, actual_col, proba_col]].copy()
+    dfp[date_col] = pd.to_datetime(dfp[date_col])
+    dfp = dfp.sort_values(date_col)
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return
+
+    y_true = dfp[actual_col].astype(float)
+    y_proba = np.clip(dfp[proba_col].astype(float), 0.0, 1.0)
+    point_bs = (y_true - y_proba) ** 2
+    roll = point_bs.rolling(int(window), min_periods=max(5, int(window // 3))).mean()
+
+    fig, ax = plt.subplots(figsize=(10.5, 4.2))
+    ax.plot(dfp[date_col], roll, color="tab:orange", lw=1.8, label=f"Rolling Brier ({int(window)}m)")
+    ax.set_title(title)
+    ax.set_xlabel("Fecha")
+    ax.set_ylabel("Brier")
+    ax.set_ylim(0.0, max(0.05, float(np.nanquantile(roll.dropna(), 0.98))) if roll.notna().any() else 1.0)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="lower left")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def compute_calibration_deciles_table(
+    df: pd.DataFrame,
+    *,
+    n_bins: int = 10,
+    actual_col: str = "actual",
+    proba_col: str = "proba_up",
+) -> pd.DataFrame:
+    dfp = df[[actual_col, proba_col]].copy()
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return pd.DataFrame()
+
+    y_true_all = dfp[actual_col].astype(int).to_numpy()
+    y_proba_all = np.clip(dfp[proba_col].astype(float).to_numpy(), 1e-9, 1.0 - 1e-9)
+    base_rate = float(np.mean(y_true_all)) if len(y_true_all) else np.nan
+
+    # Deciles por cuantiles; con duplicados puede haber < n_bins.
+    dfp["bin"] = pd.qcut(
+        dfp[proba_col].astype(float),
+        int(n_bins),
+        labels=False,
+        duplicates="drop",
+    )
+
+    rows = []
+    for b, g in dfp.groupby("bin"):
+        y_true = g[actual_col].astype(int).to_numpy()
+        y_proba = np.clip(g[proba_col].astype(float).to_numpy(), 1e-9, 1.0 - 1e-9)
+        n = int(len(g))
+
+        mean_proba = float(np.mean(y_proba)) if n else np.nan
+        emp_rate = float(np.mean(y_true)) if n else np.nan
+        ll = float(_binary_logloss(y_true, y_proba)) if n else np.nan
+        br = float(brier_score_loss(y_true, y_proba)) if n else np.nan
+        lift = float(emp_rate / base_rate) if (n and base_rate and base_rate > 0) else np.nan
+
+        rows.append(
+            {
+                "decil": int(b) + 1,
+                "n": n,
+                "p_min": float(np.min(y_proba)) if n else np.nan,
+                "p_max": float(np.max(y_proba)) if n else np.nan,
+                "mean_proba": mean_proba,
+                "empirical_rate": emp_rate,
+                "lift_vs_base": lift,
+                "logloss": ll,
+                "brier": br,
+            }
+        )
+
+    out = pd.DataFrame(rows).sort_values("decil")
+    if out.empty:
+        return out
+
+    out = out.set_index("decil")
+    return out
+
+
+def expected_calibration_error(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    *,
+    n_bins: int = 10,
+    strategy: str = "quantile",
+) -> float:
+    dfp = pd.DataFrame({"y": np.asarray(y_true, dtype=float), "p": np.asarray(y_proba, dtype=float)})
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return float("nan")
+
+    dfp["p"] = np.clip(dfp["p"].astype(float), 1e-9, 1.0 - 1e-9)
+    dfp["y"] = dfp["y"].astype(int)
+
+    if str(strategy).lower() == "quantile":
+        dfp["bin"] = pd.qcut(dfp["p"], int(n_bins), labels=False, duplicates="drop")
+    else:
+        edges = np.linspace(0.0, 1.0, int(n_bins) + 1)
+        dfp["bin"] = pd.cut(dfp["p"], bins=edges, labels=False, include_lowest=True)
+
+    n_total = float(len(dfp))
+    if n_total <= 0:
+        return float("nan")
+
+    ece = 0.0
+    for _, g in dfp.groupby("bin"):
+        n_k = float(len(g))
+        if n_k <= 0:
+            continue
+        p_k = float(g["p"].mean())
+        o_k = float(g["y"].mean())
+        ece += (n_k / n_total) * abs(o_k - p_k)
+
+    return float(ece)
+
+
+def brier_decomposition(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    *,
+    n_bins: int = 10,
+    strategy: str = "quantile",
+) -> Dict[str, float]:
+    dfp = pd.DataFrame({"y": np.asarray(y_true, dtype=float), "p": np.asarray(y_proba, dtype=float)})
+    dfp = dfp.replace([np.inf, -np.inf], np.nan).dropna()
+    if dfp.empty:
+        return {
+            "brier": float("nan"),
+            "reliability": float("nan"),
+            "resolution": float("nan"),
+            "uncertainty": float("nan"),
+            "brier_decomp": float("nan"),
+            "n_bins_eff": float("nan"),
+        }
+
+    dfp["p"] = np.clip(dfp["p"].astype(float), 1e-9, 1.0 - 1e-9)
+    dfp["y"] = dfp["y"].astype(int)
+
+    if str(strategy).lower() == "quantile":
+        dfp["bin"] = pd.qcut(dfp["p"], int(n_bins), labels=False, duplicates="drop")
+    else:
+        edges = np.linspace(0.0, 1.0, int(n_bins) + 1)
+        dfp["bin"] = pd.cut(dfp["p"], bins=edges, labels=False, include_lowest=True)
+
+    y_bar = float(dfp["y"].mean())
+    uncertainty = float(y_bar * (1.0 - y_bar))
+
+    n_total = float(len(dfp))
+    reliability = 0.0
+    resolution = 0.0
+    n_bins_eff = 0
+    for _, g in dfp.groupby("bin"):
+        n_k = float(len(g))
+        if n_k <= 0:
+            continue
+        n_bins_eff += 1
+        w_k = n_k / n_total
+        p_k = float(g["p"].mean())
+        o_k = float(g["y"].mean())
+        reliability += w_k * (p_k - o_k) ** 2
+        resolution += w_k * (o_k - y_bar) ** 2
+
+    brier = float(np.mean((dfp["y"].astype(float) - dfp["p"].astype(float)) ** 2))
+    brier_decomp = float(reliability - resolution + uncertainty)
+    return {
+        "brier": brier,
+        "reliability": float(reliability),
+        "resolution": float(resolution),
+        "uncertainty": float(uncertainty),
+        "brier_decomp": brier_decomp,
+        "n_bins_eff": float(n_bins_eff),
+    }
+
+
+def _max_drawdown_from_equity(equity: np.ndarray) -> float:
+    eq = np.asarray(equity, dtype=float)
+    if eq.size < 2:
+        return float("nan")
+    eq = np.where(np.isfinite(eq), eq, np.nan)
+    if np.all(np.isnan(eq)):
+        return float("nan")
+    eq = pd.Series(eq).ffill().bfill().to_numpy(dtype=float)
+    peak = np.maximum.accumulate(eq)
+    dd = eq / np.where(peak == 0, np.nan, peak) - 1.0
+    return float(np.nanmin(dd))
+
+
+def compute_return_risk_metrics(
+    returns: np.ndarray,
+    *,
+    periods_per_year: float = 12.0,
+    risk_free_rate_annual: float = 0.0,
+) -> Dict[str, float]:
+    r = np.asarray(returns, dtype=float)
+    r = r[np.isfinite(r)]
+    n = int(r.size)
+    if n < 2:
+        return {
+            "n": float(n),
+            "total_return": float("nan"),
+            "cagr": float("nan"),
+            "vol": float("nan"),
+            "ann_vol": float("nan"),
+            "sharpe": float("nan"),
+            "max_drawdown": float("nan"),
+            "mean_ret": float("nan"),
+            "std_ret": float("nan"),
+        }
+
+    equity = np.cumprod(1.0 + np.nan_to_num(r, nan=0.0))
+    total_return = float(equity[-1] - 1.0)
+
+    years = float(n) / float(periods_per_year) if periods_per_year else float("nan")
+    cagr = float(equity[-1] ** (1.0 / years) - 1.0) if years and years > 0 and equity[-1] > 0 else float("nan")
+
+    vol = float(np.std(r, ddof=1))
+    ann_vol = float(vol * np.sqrt(float(periods_per_year))) if periods_per_year else float("nan")
+
+    # Sharpe sobre CAGR aproximado (rf anual) / vol anual.
+    excess_ann = float(cagr - float(risk_free_rate_annual)) if np.isfinite(cagr) else float("nan")
+    sharpe = float(excess_ann / ann_vol) if ann_vol and ann_vol > 0 and np.isfinite(excess_ann) else float("nan")
+
+    mdd = _max_drawdown_from_equity(equity)
+    return {
+        "n": float(n),
+        "total_return": total_return,
+        "cagr": cagr,
+        "vol": vol,
+        "ann_vol": ann_vol,
+        "sharpe": sharpe,
+        "max_drawdown": mdd,
+        "mean_ret": float(np.mean(r)),
+        "std_ret": float(np.std(r, ddof=1)),
+    }
+
+
+def compute_signal_stability_metrics(signal: pd.Series) -> Dict[str, float]:
+    s = signal.copy()
+    s = s.replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return {
+            "n": float(0),
+            "change_pct": float("nan"),
+            "pct_long": float("nan"),
+            "avg_hold_long": float("nan"),
+            "avg_hold_flat": float("nan"),
+        }
+
+    # Normaliza a {0,1} si viene como bool/float.
+    s_bin = (s.astype(float) > 0.5).astype(int)
+    n = int(len(s_bin))
+    if n < 2:
+        return {
+            "n": float(n),
+            "change_pct": float("nan"),
+            "pct_long": float(s_bin.mean()),
+            "avg_hold_long": float("nan"),
+            "avg_hold_flat": float("nan"),
+        }
+
+    change_pct = float((s_bin != s_bin.shift(1)).iloc[1:].mean())
+    pct_long = float(s_bin.mean())
+
+    run_id = (s_bin != s_bin.shift(1)).cumsum()
+    run_len = s_bin.groupby(run_id).size().astype(float)
+    run_val = s_bin.groupby(run_id).first().astype(int)
+
+    avg_hold_long = float(run_len[run_val == 1].mean()) if (run_val == 1).any() else float("nan")
+    avg_hold_flat = float(run_len[run_val == 0].mean()) if (run_val == 0).any() else float("nan")
+
+    return {
+        "n": float(n),
+        "change_pct": change_pct,
+        "pct_long": pct_long,
+        "avg_hold_long": avg_hold_long,
+        "avg_hold_flat": avg_hold_flat,
+    }
+
+
+def compute_exposure_turnover(exposure: pd.Series) -> Dict[str, float]:
+    x = exposure.copy()
+    x = x.replace([np.inf, -np.inf], np.nan).dropna().astype(float)
+    if len(x) < 2:
+        return {"n": float(len(x)), "mean_abs_change": float("nan"), "median_abs_change": float("nan")}
+
+    dx = x.diff().abs().iloc[1:]
+    return {
+        "n": float(len(x)),
+        "mean_abs_change": float(dx.mean()),
+        "median_abs_change": float(dx.median()),
+    }
+
+
 def plot_regime_performance_wf(
     wf_df: pd.DataFrame,
     *,
@@ -1177,13 +1531,13 @@ features = [
     # f"roc_{HORIZON}",
 ]
 
-features = [
-    "equity_risk_premium",
-    "credit_spread",
-    "unemp_change_12m",
-    "m2_yoy",
-    "permit_yoy",
-]
+# features = [
+#     "equity_risk_premium",
+#     "credit_spread",
+#     "unemp_change_12m",
+#     "m2_yoy",
+#     "permit_yoy",
+# ]
 # features = min_features
 print(f"Number of features: {len(features)}")
 
@@ -1701,6 +2055,134 @@ wf_df = (
     .reset_index(drop=True)
 )
 
+# ==============================
+# WalkForward — Risk / Turnover / Calibration (más duro)
+# ==============================
+# Nota: estas métricas se calculan sobre retornos 1M realizados (close_t -> close_{t+1})
+# para que Sharpe/vol/drawdown sean comparables y no sufran del solape del forward-return.
+wf_ret_df = wf_df[["date", "close_t", "proba_up", "pred", "actual"]].copy()
+wf_ret_df["date"] = pd.to_datetime(wf_ret_df["date"])
+wf_ret_df = wf_ret_df.sort_values("date").replace([np.inf, -np.inf], np.nan).dropna(subset=["close_t", "proba_up"])
+
+if len(wf_ret_df) >= 3:
+    wf_ret_df["ret_1m"] = wf_ret_df["close_t"].astype(float).shift(-1) / wf_ret_df["close_t"].astype(float) - 1.0
+    wf_ret_df = wf_ret_df.iloc[:-1].copy()  # última fila no tiene ret_1m
+
+    exposure_proba = np.clip(wf_ret_df["proba_up"].astype(float).to_numpy(), 0.0, 1.0)
+    exposure_pred = (wf_ret_df["pred"].astype(float).to_numpy() > 0.5).astype(float)
+    ret_1m = wf_ret_df["ret_1m"].astype(float).to_numpy()
+
+    wf_risk_bh = compute_return_risk_metrics(ret_1m, periods_per_year=12.0)
+    wf_risk_proba = compute_return_risk_metrics(exposure_proba * ret_1m, periods_per_year=12.0)
+    wf_risk_pred = compute_return_risk_metrics(exposure_pred * ret_1m, periods_per_year=12.0)
+
+    wf_risk_table = pd.DataFrame(
+        {
+            "Buy&Hold": wf_risk_bh,
+            "Estrategia (exposure=P)": wf_risk_proba,
+            "Estrategia (pred 0/1)": wf_risk_pred,
+        }
+    )
+    wf_risk_table = wf_risk_table.reindex(
+        [
+            "n",
+            "total_return",
+            "cagr",
+            "ann_vol",
+            "sharpe",
+            "max_drawdown",
+            "mean_ret",
+            "std_ret",
+        ]
+    )
+    _save_table_figure(
+        wf_risk_table,
+        out_path=BASE_DIR / "walk_forward_risk_metrics_1m.png",
+        title=f"Walk-Forward — Riesgo / Sharpe (retornos 1M, horizonte target {HORIZON}m)",
+    )
+
+    # Turnover / estabilidad de señal
+    wf_signal_series = wf_df.set_index(pd.to_datetime(wf_df["date"]))["pred"]
+    wf_stab = compute_signal_stability_metrics(wf_signal_series)
+    wf_turn = compute_exposure_turnover(wf_df.set_index(pd.to_datetime(wf_df["date"]))["proba_up"])
+
+    wf_turnover_table = pd.DataFrame(
+        {
+            "Valor": [
+                wf_stab.get("n", np.nan),
+                wf_stab.get("pct_long", np.nan),
+                wf_stab.get("change_pct", np.nan),
+                wf_stab.get("avg_hold_long", np.nan),
+                wf_stab.get("avg_hold_flat", np.nan),
+                wf_turn.get("mean_abs_change", np.nan),
+                wf_turn.get("median_abs_change", np.nan),
+            ]
+        },
+        index=[
+            "n (meses)",
+            "% tiempo long (pred=1)",
+            "% cambios de señal (pred)",
+            "Duración media long (meses)",
+            "Duración media flat (meses)",
+            "Turnover exposure (mean |ΔP|)",
+            "Turnover exposure (median |ΔP|)",
+        ],
+    )
+    _save_table_figure(
+        wf_turnover_table,
+        out_path=BASE_DIR / "walk_forward_turnover_signal_stability.png",
+        title=f"Walk-Forward — Turnover / Estabilidad de señal ({HORIZON}m)",
+    )
+
+    # Calibration más dura: ECE + descomposición de Brier
+    wf_y_true = wf_df["actual"].astype(int).to_numpy()
+    wf_y_proba = np.clip(wf_df["proba_up"].astype(float).to_numpy(), 1e-9, 1.0 - 1e-9)
+    wf_base = float(np.mean(wf_y_true)) if len(wf_y_true) else float("nan")
+
+    wf_ece = expected_calibration_error(wf_y_true, wf_y_proba, n_bins=10, strategy="quantile")
+    wf_bd = brier_decomposition(wf_y_true, wf_y_proba, n_bins=10, strategy="quantile")
+
+    wf_y_proba_base = np.full_like(wf_y_proba, float(np.clip(wf_base, 1e-9, 1.0 - 1e-9)))
+    wf_ece_base = expected_calibration_error(wf_y_true, wf_y_proba_base, n_bins=10, strategy="quantile")
+    wf_bd_base = brier_decomposition(wf_y_true, wf_y_proba_base, n_bins=10, strategy="quantile")
+
+    wf_calib_hard_table = pd.DataFrame(
+        {
+            "Modelo (WF)": [
+                wf_ece,
+                float(brier_score_loss(wf_y_true, wf_y_proba)),
+                wf_bd.get("reliability", np.nan),
+                wf_bd.get("resolution", np.nan),
+                wf_bd.get("uncertainty", np.nan),
+                wf_bd.get("brier_decomp", np.nan),
+                wf_bd.get("n_bins_eff", np.nan),
+            ],
+            "Baseline (p const)": [
+                wf_ece_base,
+                float(brier_score_loss(wf_y_true, wf_y_proba_base)),
+                wf_bd_base.get("reliability", np.nan),
+                wf_bd_base.get("resolution", np.nan),
+                wf_bd_base.get("uncertainty", np.nan),
+                wf_bd_base.get("brier_decomp", np.nan),
+                wf_bd_base.get("n_bins_eff", np.nan),
+            ],
+        },
+        index=[
+            "ECE (quantile bins)",
+            "Brier",
+            "Brier: Reliability",
+            "Brier: Resolution",
+            "Brier: Uncertainty",
+            "Brier: Decomposition total",
+            "Bins efectivos",
+        ],
+    )
+    _save_table_figure(
+        wf_calib_hard_table,
+        out_path=BASE_DIR / "walk_forward_calibration_hard_metrics.png",
+        title=f"Walk-Forward — Calibration dura (ECE + Brier decomposition, {HORIZON}m)",
+    )
+
 # Señal suavizada sobre probabilidad
 wf_df["signal_raw"] = wf_df["proba_up"]
 wf_df["signal"] = wf_df["proba_up"] - 0.5
@@ -1736,6 +2218,13 @@ _save_table_figure(
     wf_threshold_cm,
     out_path=BASE_DIR / "walk_forward_confusion_matrix_thresholds.png",
     title=f"Walk-Forward — Confusion matrix por threshold ({HORIZON}m)",
+)
+
+plot_confusion_matrix_heatmap(
+    wf_df["actual"],
+    wf_df["pred"].to_numpy(),
+    out_path=BASE_DIR / "walk_forward_confusion_matrix_heatmap.png",
+    title=f"Walk-Forward — Matriz de confusión (pred optimizado, {HORIZON}m)",
 )
 
 print("\n[WalkForward ranking metrics]\n", wf_ranking_metrics)
@@ -2081,12 +2570,259 @@ else:
         }
     ).sort_values("date")
 
+    # ==============================
+    # Final Roll-out — Risk / Turnover / Calibration dura
+    # ==============================
+    roll_ret_df = roll_plot_df[["date", "close_t", "proba_up", "pred", "actual"]].copy()
+    roll_ret_df["date"] = pd.to_datetime(roll_ret_df["date"])
+    roll_ret_df = roll_ret_df.sort_values("date").replace([np.inf, -np.inf], np.nan).dropna(subset=["close_t", "proba_up"])
+
+    if len(roll_ret_df) >= 3:
+        roll_ret_df["ret_1m"] = roll_ret_df["close_t"].astype(float).shift(-1) / roll_ret_df["close_t"].astype(float) - 1.0
+        roll_ret_df = roll_ret_df.iloc[:-1].copy()
+
+        roll_exposure_proba = np.clip(roll_ret_df["proba_up"].astype(float).to_numpy(), 0.0, 1.0)
+        roll_exposure_pred = (roll_ret_df["pred"].astype(float).to_numpy() > 0.5).astype(float)
+        roll_ret_1m = roll_ret_df["ret_1m"].astype(float).to_numpy()
+
+        roll_risk_bh = compute_return_risk_metrics(roll_ret_1m, periods_per_year=12.0)
+        roll_risk_proba = compute_return_risk_metrics(roll_exposure_proba * roll_ret_1m, periods_per_year=12.0)
+        roll_risk_pred = compute_return_risk_metrics(roll_exposure_pred * roll_ret_1m, periods_per_year=12.0)
+
+        roll_risk_table = pd.DataFrame(
+            {
+                "Buy&Hold": roll_risk_bh,
+                "Estrategia (exposure=P)": roll_risk_proba,
+                "Estrategia (pred 0/1)": roll_risk_pred,
+            }
+        ).reindex(
+            [
+                "n",
+                "total_return",
+                "cagr",
+                "ann_vol",
+                "sharpe",
+                "max_drawdown",
+                "mean_ret",
+                "std_ret",
+            ]
+        )
+        _save_table_figure(
+            roll_risk_table,
+            out_path=BASE_DIR / "final_rollout_risk_metrics_1m.png",
+            title=f"Final Roll-out — Riesgo / Sharpe (retornos 1M, target {HORIZON}m)",
+        )
+
+        roll_stab = compute_signal_stability_metrics(roll_plot_df.set_index(pd.to_datetime(roll_plot_df["date"]))["pred"])
+        roll_turn = compute_exposure_turnover(roll_plot_df.set_index(pd.to_datetime(roll_plot_df["date"]))["proba_up"])
+        roll_turnover_table = pd.DataFrame(
+            {
+                "Valor": [
+                    roll_stab.get("n", np.nan),
+                    roll_stab.get("pct_long", np.nan),
+                    roll_stab.get("change_pct", np.nan),
+                    roll_stab.get("avg_hold_long", np.nan),
+                    roll_stab.get("avg_hold_flat", np.nan),
+                    roll_turn.get("mean_abs_change", np.nan),
+                    roll_turn.get("median_abs_change", np.nan),
+                ]
+            },
+            index=[
+                "n (meses)",
+                "% tiempo long (pred=1)",
+                "% cambios de señal (pred)",
+                "Duración media long (meses)",
+                "Duración media flat (meses)",
+                "Turnover exposure (mean |ΔP|)",
+                "Turnover exposure (median |ΔP|)",
+            ],
+        )
+        _save_table_figure(
+            roll_turnover_table,
+            out_path=BASE_DIR / "final_rollout_turnover_signal_stability.png",
+            title=f"Final Roll-out — Turnover / Estabilidad de señal ({HORIZON}m)",
+        )
+
+        roll_y_true = roll_plot_df["actual"].astype(int).to_numpy()
+        roll_y_proba = np.clip(roll_plot_df["proba_up"].astype(float).to_numpy(), 1e-9, 1.0 - 1e-9)
+        roll_base = float(np.mean(roll_y_true)) if len(roll_y_true) else float("nan")
+        roll_ece = expected_calibration_error(roll_y_true, roll_y_proba, n_bins=10, strategy="quantile")
+        roll_bd = brier_decomposition(roll_y_true, roll_y_proba, n_bins=10, strategy="quantile")
+
+        roll_y_proba_base = np.full_like(roll_y_proba, float(np.clip(roll_base, 1e-9, 1.0 - 1e-9)))
+        roll_ece_base = expected_calibration_error(roll_y_true, roll_y_proba_base, n_bins=10, strategy="quantile")
+        roll_bd_base = brier_decomposition(roll_y_true, roll_y_proba_base, n_bins=10, strategy="quantile")
+
+        roll_calib_hard_table = pd.DataFrame(
+            {
+                "Modelo (rollout)": [
+                    roll_ece,
+                    float(brier_score_loss(roll_y_true, roll_y_proba)),
+                    roll_bd.get("reliability", np.nan),
+                    roll_bd.get("resolution", np.nan),
+                    roll_bd.get("uncertainty", np.nan),
+                    roll_bd.get("brier_decomp", np.nan),
+                    roll_bd.get("n_bins_eff", np.nan),
+                ],
+                "Baseline (p const)": [
+                    roll_ece_base,
+                    float(brier_score_loss(roll_y_true, roll_y_proba_base)),
+                    roll_bd_base.get("reliability", np.nan),
+                    roll_bd_base.get("resolution", np.nan),
+                    roll_bd_base.get("uncertainty", np.nan),
+                    roll_bd_base.get("brier_decomp", np.nan),
+                    roll_bd_base.get("n_bins_eff", np.nan),
+                ],
+            },
+            index=[
+                "ECE (quantile bins)",
+                "Brier",
+                "Brier: Reliability",
+                "Brier: Resolution",
+                "Brier: Uncertainty",
+                "Brier: Decomposition total",
+                "Bins efectivos",
+            ],
+        )
+        _save_table_figure(
+            roll_calib_hard_table,
+            out_path=BASE_DIR / "final_rollout_calibration_hard_metrics.png",
+            title=f"Final Roll-out — Calibration dura (ECE + Brier decomposition, {HORIZON}m)",
+        )
+
     plot_classification_timeline(
         roll_plot_df,
         out_path=BASE_DIR / "final_rollout_classification.png",
         title=f"Final Roll-out — Probabilidades vs clase real ({HORIZON}m)",
         year_locator=1,
     )
+
+    # ==============================
+    # (1) Análisis temporal interno (roll) + split early/late
+    # ==============================
+    plot_rolling_logloss_wf(
+        roll_plot_df,
+        out_path=BASE_DIR / "final_rollout_rolling_logloss_36m.png",
+        title=f"Final Roll-out — Rolling LogLoss (36m, horizonte {HORIZON}m)",
+        window=36,
+    )
+    plot_rolling_brier_wf(
+        roll_plot_df,
+        out_path=BASE_DIR / "final_rollout_rolling_brier_36m.png",
+        title=f"Final Roll-out — Rolling Brier (36m, horizonte {HORIZON}m)",
+        window=36,
+    )
+
+    roll_split_metrics = None
+    if len(roll_plot_df) >= 10:
+        split_idx = int(len(roll_plot_df) // 2)
+        split_date = pd.to_datetime(roll_plot_df["date"].iloc[split_idx])
+
+        def _block_metrics(name: str, g: pd.DataFrame) -> Dict[str, float]:
+            y_true = g["actual"].astype(int).to_numpy()
+            y_proba = np.clip(g["proba_up"].astype(float).to_numpy(), 1e-9, 1.0 - 1e-9)
+            y_pred = (y_proba >= float(best_t_roll)).astype(int)
+            n = int(len(g))
+
+            out_m: Dict[str, float] = {
+                "n": float(n),
+                "base_rate": float(np.mean(y_true)) if n else np.nan,
+                "logloss": float(_binary_logloss(y_true, y_proba)) if n else np.nan,
+                "brier": float(brier_score_loss(y_true, y_proba)) if n else np.nan,
+                "precision_top20": float(_precision_at_k(pd.Series(y_true), y_proba, top_frac=0.2)) if n else np.nan,
+                "lift_top20": float(_lift_at_k(pd.Series(y_true), y_proba, top_frac=0.2)) if n else np.nan,
+                "recall_0": float(recall_score(y_true, y_pred, pos_label=0, zero_division=0)) if n else np.nan,
+                "accuracy": float(accuracy_score(y_true, y_pred)) if n else np.nan,
+                "f1": float(f1_score(y_true, y_pred, zero_division=0)) if n else np.nan,
+            }
+            if n > 2 and len(np.unique(y_true)) > 1:
+                out_m["auc"] = float(roc_auc_score(y_true, y_proba))
+                out_m["ap"] = float(average_precision_score(y_true, y_proba))
+            else:
+                out_m["auc"] = np.nan
+                out_m["ap"] = np.nan
+            return out_m
+
+        g_early = roll_plot_df.loc[roll_plot_df["date"] <= split_date]
+        g_late = roll_plot_df.loc[roll_plot_df["date"] > split_date]
+        m_all = _block_metrics("all", roll_plot_df)
+        m_early = _block_metrics("early", g_early)
+        m_late = _block_metrics("late", g_late)
+
+        roll_split_metrics = pd.DataFrame(
+            {
+                "All": m_all,
+                f"Early (<= {split_date.date()})": m_early,
+                f"Late (> {split_date.date()})": m_late,
+            }
+        )
+        # Orden de lectura: tamaño/base-rate y luego probabilísticas.
+        row_order = [
+            "n",
+            "base_rate",
+            "auc",
+            "ap",
+            "logloss",
+            "brier",
+            "precision_top20",
+            "lift_top20",
+            "recall_0",
+            "accuracy",
+            "f1",
+        ]
+        roll_split_metrics = roll_split_metrics.reindex(row_order)
+
+        _save_table_figure(
+            roll_split_metrics,
+            out_path=BASE_DIR / "final_rollout_subperiod_metrics.png",
+            title=f"Final Roll-out — Métricas por subperiodo (threshold={best_t_roll:.3f})",
+        )
+        print("\n[FinalRollout temporal split metrics]\n", roll_split_metrics)
+
+    # ==============================
+    # (2) Calibración (curve + deciles)
+    # ==============================
+    plot_calibration_curve_wf(
+        roll_plot_df,
+        out_path=BASE_DIR / "final_rollout_calibration.png",
+        title=f"Final Roll-out — Calibration curve ({HORIZON}m)",
+        n_bins=10,
+    )
+    plot_metrics_by_proba_bin(
+        roll_plot_df,
+        out_path=BASE_DIR / "final_rollout_metrics_by_decile.png",
+        title=f"Final Roll-out — Calibration por decil (P(sube) vs P(real=1), {HORIZON}m)",
+        n_bins=10,
+    )
+    roll_calib_deciles = compute_calibration_deciles_table(roll_plot_df, n_bins=10)
+    if roll_calib_deciles is not None and not roll_calib_deciles.empty:
+        _save_table_figure(
+            roll_calib_deciles,
+            out_path=BASE_DIR / "final_rollout_calibration_deciles_table.png",
+            title=f"Final Roll-out — Tabla de calibración por decil ({HORIZON}m)",
+        )
+        print("\n[FinalRollout calibration deciles table]\n", roll_calib_deciles)
+
+    # ==============================
+    # (3) Análisis de régimen (si existe high_inflation)
+    # ==============================
+    if "high_inflation" in df.columns:
+        regime_series_roll = df["high_inflation"].astype(float).map({1.0: "high_inflation", 0.0: "low_inflation"})
+        roll_regime_df = plot_regime_performance_wf(
+            roll_plot_df,
+            out_path=BASE_DIR / "final_rollout_regime_performance.png",
+            title=f"Final Roll-out — Performance por régimen (high/low inflation)",
+            regime_series=regime_series_roll,
+        )
+        if roll_regime_df is not None and not roll_regime_df.empty:
+            _save_table_figure(
+                roll_regime_df.set_index("regime"),
+                out_path=BASE_DIR / "final_rollout_regime_performance_table.png",
+                title="Final Roll-out — Tabla performance por régimen",
+            )
+            print("\n[FinalRollout regime performance]\n", roll_regime_df)
+    else:
+        print("[FinalRollout] Nota: no existe columna 'high_inflation' → sin análisis de régimen.")
 
     # ==============================
     # ROI: Buy&Hold DCA vs Señal (2x cuando pred=1) — Final Roll-out
@@ -2186,62 +2922,29 @@ print(f"P(sube) en {HORIZON} meses:", final_proba)
 final_proba_all = final_model.predict_proba(X)[:, 1]
 final_logloss = float(_binary_logloss(y.values, final_proba_all))
 final_brier = float(brier_score_loss(y, final_proba_all))
-final_pred_07 = (final_proba_all >= 0.7).astype(int)
-final_base_rate = float(y.mean())
 final_precision_top20 = _precision_at_k(y, final_proba_all, top_frac=0.2)
-final_lift_top20 = _lift_at_k(y, final_proba_all, top_frac=0.2)
-final_recall_0_07 = float(recall_score(y, final_pred_07, pos_label=0, zero_division=0))
-final_threshold_cm = _confusion_matrix_by_thresholds(y, final_proba_all)
 if len(np.unique(y)) > 1:
     final_auc = float(roc_auc_score(y, final_proba_all))
-    final_ap = float(average_precision_score(y, final_proba_all))
 else:
     final_auc = float("nan")
-    final_ap = float("nan")
 
-# Baselines (comparación justa): prob. constante
-p0 = float(np.clip(y.mean(), 1e-6, 1 - 1e-6))
-baseline_ll = float(_binary_logloss(y.values, np.full_like(final_proba_all, p0)))
-baseline_br = float(brier_score_loss(y, np.full_like(final_proba_all, p0)))
+# ===== Incertidumbre (histórico de probabilidades in-sample) =====
+# Nota: esto no es un intervalo de confianza estadístico; es una medida
+# de rareza relativa vs el histórico de P(sube) generado por el propio modelo.
+hist_mean = float(np.nanmean(final_proba_all))
+hist_std = float(np.nanstd(final_proba_all, ddof=0))
+final_proba_percentile = float(np.mean(final_proba_all <= final_proba) * 100.0)
+final_proba_z = float((final_proba - hist_mean) / hist_std) if hist_std > 0 else float("nan")
 
+print("\n[FinalModel] NOTE: métricas in-sample (solo diagnóstico, no performance real)")
 print("[FinalModel] ROC-AUC:", final_auc)
-print("[FinalModel] PR-AUC:", final_ap)
 print("[FinalModel] LogLoss:", final_logloss)
 print("[FinalModel] Brier:", final_brier)
-print("[FinalModel] Base rate clase 1:", final_base_rate)
 print("[FinalModel] Precision@top20%:", final_precision_top20)
-print("[FinalModel] Lift@top20%:", final_lift_top20)
-print("[FinalModel] Recall clase 0 @0.7:", final_recall_0_07)
-print("[FinalModel] Baseline LogLoss (p const train):", baseline_ll)
-print("[FinalModel] Baseline Brier (p const train):", baseline_br)
-print("\n[FinalModel confusion matrix por threshold]\n", final_threshold_cm)
-
-final_ranking_metrics = pd.DataFrame(
-    {
-        "Valor": [
-            final_base_rate,
-            final_precision_top20,
-            final_lift_top20,
-            final_recall_0_07,
-        ]
-    },
-    index=[
-        "Base rate clase 1",
-        "Precision@top20%",
-        "Lift@top20%",
-        "Recall clase 0 @0.7",
-    ],
-)
-_save_table_figure(
-    final_ranking_metrics,
-    out_path=BASE_DIR / "final_model_ranking_metrics.png",
-    title=f"Final Model — Métricas para señal top 20% ({HORIZON}m)",
-)
-_save_table_figure(
-    final_threshold_cm,
-    out_path=BASE_DIR / "final_model_confusion_matrix_thresholds.png",
-    title=f"Final Model — Confusion matrix por threshold ({HORIZON}m)",
-)
+print("[FinalModel] P(sube) percentil histórico (%):", final_proba_percentile)
+print("[FinalModel] P(sube) z-score vs histórico:", final_proba_z)
+print("[FinalModel vs WF] LogLoss diff:", final_logloss - np.nanmean(loglosses))
+print("[FinalModel vs WF] AUC diff:", final_auc - np.nanmean(aucs))
 
 # ==============================
 # SHAP (clasificación binaria)
