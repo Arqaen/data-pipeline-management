@@ -17,6 +17,7 @@ from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
     brier_score_loss,
+    confusion_matrix,
     f1_score,
     roc_auc_score,
     log_loss,
@@ -61,6 +62,58 @@ def _best_threshold_by_f1(
     return best_t, float(best_f1)
 
 
+def _precision_at_k(y_true: pd.Series, y_proba: np.ndarray, *, top_frac: float = 0.2) -> float:
+    y_arr = np.asarray(y_true, dtype=int)
+    proba = np.asarray(y_proba, dtype=float)
+    if len(y_arr) == 0:
+        return float("nan")
+
+    k = max(1, int(float(top_frac) * len(y_arr)))
+    idx = np.argsort(proba)[-k:]
+    return float(y_arr[idx].mean())
+
+
+def _lift_at_k(y_true: pd.Series, y_proba: np.ndarray, *, top_frac: float = 0.2) -> float:
+    y_arr = np.asarray(y_true, dtype=int)
+    if len(y_arr) == 0:
+        return float("nan")
+
+    base_rate = float(y_arr.mean())
+    if base_rate <= 0.0:
+        return float("nan")
+
+    return float(_precision_at_k(y_arr, y_proba, top_frac=top_frac) / base_rate)
+
+
+def _confusion_matrix_by_thresholds(
+    y_true: pd.Series,
+    y_proba: np.ndarray,
+    *,
+    thresholds: Tuple[float, ...] = (0.5, 0.7, 0.8),
+) -> pd.DataFrame:
+    y_arr = np.asarray(y_true, dtype=int)
+    proba = np.asarray(y_proba, dtype=float)
+    rows = []
+
+    for threshold in thresholds:
+        y_pred = (proba >= float(threshold)).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_arr, y_pred, labels=[0, 1]).ravel()
+        rows.append(
+            {
+                "threshold": float(threshold),
+                "tn": int(tn),
+                "fp": int(fp),
+                "fn": int(fn),
+                "tp": int(tp),
+                "precision": float(precision_score(y_arr, y_pred, zero_division=0)),
+                "recall_1": float(recall_score(y_arr, y_pred, pos_label=1, zero_division=0)),
+                "recall_0": float(recall_score(y_arr, y_pred, pos_label=0, zero_division=0)),
+            }
+        )
+
+    return pd.DataFrame(rows).set_index("threshold")
+
+
 def _sample_param_combo(param_dist: Dict[str, List], rng: np.random.RandomState) -> Dict:
     return {key: rng.choice(values) for key, values in param_dist.items()}
 
@@ -91,15 +144,13 @@ def tune_xgb_random_search_timeval(
         # Mezclamos para que params (random search) sobrescriba a fixed_params.
         model_params = dict(fixed_params)
         model_params.update(params)
-        early_stopping_rounds = model_params.pop("early_stopping_rounds", 100)
-        early_stopping_rounds = None if early_stopping_rounds is None else int(early_stopping_rounds)
         model = XGBClassifier(**model_params)
         model.fit(
             X_tr,
             y_tr,
             eval_set=[(X_es, y_es)],
             verbose=False,
-            early_stopping_rounds=early_stopping_rounds,
+            early_stopping_rounds=model_params.get("early_stopping_rounds", 100),
         )
         score_proba = model.predict_proba(X_score)[:, 1]
 
@@ -1173,7 +1224,7 @@ features = valid_features
 print( "features con suficiente historia:", features)
 
 # TARGET  
-min_train_size = 240
+min_train_size = 120
 test_size = 12 
 close_fwd = df["Close"].shift(-HORIZON)
 df["close_fwd"] = close_fwd
@@ -1190,10 +1241,10 @@ df["target_reg"] = np.where(
 
 
 
-# risk_free_horizon = (df["TB3MS"] / 100.0) * (HORIZON / 12)
+# risk_free = (df["TB3MS"] / 100.0) * (HORIZON / 12)
 # df["target"] = np.where(
 #     close_fwd.notna() & df["TB3MS"].notna(),
-#     df["future_return"] > risk_free_horizon,
+#     df["future_return"] > risk_free,
 #     np.nan,
 # )
 
@@ -1393,8 +1444,11 @@ balanced_accs = []
 mccs = []
 precisions = []
 recalls = []
+recalls_0 = []
 f1s = []
 accuracies = []
+precision_at_top20s = []
+lift_top20s = []
 
 baseline_loglosses = []
 baseline_briers = []
@@ -1505,9 +1559,6 @@ while start < len(df) - test_size:
     model_params = dict(fold_fixed_params)
     model_params.update(best_params)
 
-    early_stopping_rounds = model_params.pop("early_stopping_rounds", 100)
-    early_stopping_rounds = None if early_stopping_rounds is None else int(early_stopping_rounds)
-
     model = XGBClassifier(**model_params)
     # ===== CHECK: evitar validation inválida =====
     if len(np.unique(y_es)) < 2:
@@ -1536,6 +1587,7 @@ while start < len(df) - test_size:
 
     # Probabilidades
     proba = model.predict_proba(X_test)[:, 1]
+    # proba = 1 - proba
 
     # Predicción de clase usando threshold optimizado (NO 0.5 fijo)
     y_pred = (proba >= best_t).astype(int)
@@ -1558,8 +1610,11 @@ while start < len(df) - test_size:
     mccs.append(float(matthews_corrcoef(y_test, y_pred)))
     precisions.append(float(precision_score(y_test, y_pred, zero_division=0)))
     recalls.append(float(recall_score(y_test, y_pred, zero_division=0)))
+    recalls_0.append(float(recall_score(y_test, y_pred, pos_label=0, zero_division=0)))
     f1s.append(float(f1_score(y_test, y_pred, zero_division=0)))
     accuracies.append(float(accuracy_score(y_test, y_pred)))
+    precision_at_top20s.append(_precision_at_k(y_test, proba, top_frac=0.2))
+    lift_top20s.append(_lift_at_k(y_test, proba, top_frac=0.2))
 
     if len(np.unique(y_test)) > 1:
         aucs.append(roc_auc_score(y_test, proba))
@@ -1586,8 +1641,11 @@ wf_metrics_scorecard = pd.DataFrame(
             float(np.nanmean(mccs)),
             float(np.nanmean(precisions)),
             float(np.nanmean(recalls)),
+            float(np.nanmean(recalls_0)),
             float(np.nanmean(f1s)),
             float(np.nanmean(accuracies)),
+            float(np.nanmean(precision_at_top20s)),
+            float(np.nanmean(lift_top20s)),
         ]
     },
     index=[
@@ -1599,8 +1657,11 @@ wf_metrics_scorecard = pd.DataFrame(
         "MCC (mean)",
         "Precision (mean)",
         "Recall (mean)",
+        "Recall clase 0 (mean)",
         "F1 (mean)",
         "Accuracy (mean)",
+        "Precision@top20% (mean)",
+        "Lift@top20% (mean)",
     ],
 )
 _save_table_figure(
@@ -1640,6 +1701,42 @@ wf_df = (
 # Señal suavizada sobre probabilidad
 wf_df["signal_raw"] = wf_df["proba_up"]
 wf_df["signal"] = wf_df["proba_up"] - 0.5
+
+wf_top20_precision = _precision_at_k(wf_df["actual"], wf_df["proba_up"].to_numpy(), top_frac=0.2)
+wf_top20_lift = _lift_at_k(wf_df["actual"], wf_df["proba_up"].to_numpy(), top_frac=0.2)
+wf_recall_0 = float(recall_score(wf_df["actual"], wf_df["pred"], pos_label=0, zero_division=0))
+wf_base_rate = float(wf_df["actual"].mean())
+wf_threshold_cm = _confusion_matrix_by_thresholds(wf_df["actual"], wf_df["proba_up"].to_numpy())
+
+wf_ranking_metrics = pd.DataFrame(
+    {
+        "Valor": [
+            wf_base_rate,
+            wf_top20_precision,
+            wf_top20_lift,
+            wf_recall_0,
+        ]
+    },
+    index=[
+        "Base rate clase 1",
+        "Precision@top20%",
+        "Lift@top20%",
+        "Recall clase 0",
+    ],
+)
+_save_table_figure(
+    wf_ranking_metrics,
+    out_path=BASE_DIR / "walk_forward_ranking_metrics.png",
+    title=f"Walk-Forward — Métricas para señal top 20% ({HORIZON}m)",
+)
+_save_table_figure(
+    wf_threshold_cm,
+    out_path=BASE_DIR / "walk_forward_confusion_matrix_thresholds.png",
+    title=f"Walk-Forward — Confusion matrix por threshold ({HORIZON}m)",
+)
+
+print("\n[WalkForward ranking metrics]\n", wf_ranking_metrics)
+print("\n[WalkForward confusion matrix por threshold]\n", wf_threshold_cm)
 
 # ── Gráfico Walk-Forward: probabilidad vs clase real ──
 plot_classification_timeline(
@@ -1734,12 +1831,12 @@ plt.tight_layout()
 plt.savefig(BASE_DIR / "decile_plot_classification.png")
 
 # ==============================
-# ROI: Buy&Hold DCA vs Señal (exposición continua ~ P(sube))
+# ROI: Buy&Hold DCA vs Señal (2x cuando pred=1, 0x cuando pred=0)
 # ==============================
 monthly_amount = 1.0
 signal_multiplier = 2.0
 
-wf_signal = wf_df[["date", "proba_up"]].copy()
+wf_signal = wf_df[["date", "pred"]].copy()
 wf_signal["date"] = pd.to_datetime(wf_signal["date"])
 wf_signal = wf_signal.set_index("date").sort_index()
 
@@ -1747,15 +1844,17 @@ eval_start = pd.to_datetime(wf_df["date"].min())
 eval_end = pd.to_datetime(wf_df["date"].max())
 
 prices_eval = df.loc[eval_start:eval_end, "Close"].copy()
-proba_aligned = wf_signal["proba_up"].reindex(prices_eval.index)
+pred_aligned = wf_signal["pred"].reindex(prices_eval.index)
 
 # Comparación justa: usar SOLO los meses en los que hay predicción walk-forward.
-has_pred = proba_aligned.notna()
+has_pred = pred_aligned.notna()
 prices_eval = prices_eval.loc[has_pred]
-proba_aligned = proba_aligned.loc[has_pred]
+pred_aligned = pred_aligned.loc[has_pred]
 
 contrib_bh = pd.Series(monthly_amount, index=prices_eval.index)
-contrib_signal = monthly_amount * float(signal_multiplier) * np.clip(proba_aligned.astype(float), 0.0, 1.0).fillna(0.0)
+contrib_signal = monthly_amount * float(signal_multiplier) * (pred_aligned.astype(int) == 1).astype(float)
+
+
 
 bh_curve = simulate_monthly_dca_roi(prices_eval, contrib_bh)
 sig_curve = simulate_monthly_dca_roi(prices_eval, contrib_signal)
@@ -1765,7 +1864,7 @@ ax.plot(bh_curve.index, bh_curve["roi_pct"], label=f"Buy&Hold DCA (x={monthly_am
 ax.plot(
     sig_curve.index,
     sig_curve["roi_pct"],
-    label=f"Señal (comprar entre 0x y {signal_multiplier:g}x según P(sube))",
+    label=f"Señal (clase 1: {signal_multiplier:g}x, clase 0: 0x)",
     color="purple",
 )
 
@@ -1780,7 +1879,7 @@ plt.tight_layout()
 plt.savefig(BASE_DIR / "roi_strategies_walk_forward.png")
 
 print("\nROI final Buy&Hold DCA (%):", float(bh_curve["roi_pct"].dropna().iloc[-1]))
-print("ROI final Señal (proba) (%):", float(sig_curve["roi_pct"].dropna().iloc[-1]))
+print("ROI final Señal (clase) (%):", float(sig_curve["roi_pct"].dropna().iloc[-1]))
 # print("Total invertido Buy&Hold:", float(bh_curve["invested"].dropna().iloc[-1]))
 # print("Total invertido Señal:", float(sig_curve["invested"].dropna().iloc[-1]))
 
@@ -1895,6 +1994,11 @@ else:
     # ===== Métricas rollout =====
     roll_logloss = float(_binary_logloss(y_roll.values, roll_proba))
     roll_brier = float(brier_score_loss(y_roll, roll_proba))
+    roll_base_rate = float(y_roll.mean())
+    roll_precision_top20 = _precision_at_k(y_roll, roll_proba, top_frac=0.2)
+    roll_lift_top20 = _lift_at_k(y_roll, roll_proba, top_frac=0.2)
+    roll_recall_0 = float(recall_score(y_roll, roll_pred, pos_label=0, zero_division=0))
+    roll_threshold_cm = _confusion_matrix_by_thresholds(y_roll, roll_proba)
     if len(np.unique(y_roll)) > 1:
         roll_auc = float(roc_auc_score(y_roll, roll_proba))
         roll_ap = float(average_precision_score(y_roll, roll_proba))
@@ -1913,8 +2017,40 @@ else:
     print("[FinalRollout] PR-AUC:", roll_ap)
     print("[FinalRollout] LogLoss:", roll_logloss)
     print("[FinalRollout] Brier:", roll_brier)
+    print("[FinalRollout] Base rate clase 1:", roll_base_rate)
+    print("[FinalRollout] Precision@top20%:", roll_precision_top20)
+    print("[FinalRollout] Lift@top20%:", roll_lift_top20)
+    print("[FinalRollout] Recall clase 0:", roll_recall_0)
     print("[FinalRollout] Baseline LogLoss (p const train):", baseline_ll)
     print("[FinalRollout] Baseline Brier (p const train):", baseline_br)
+    print("\n[FinalRollout confusion matrix por threshold]\n", roll_threshold_cm)
+
+    roll_ranking_metrics = pd.DataFrame(
+        {
+            "Valor": [
+                roll_base_rate,
+                roll_precision_top20,
+                roll_lift_top20,
+                roll_recall_0,
+            ]
+        },
+        index=[
+            "Base rate clase 1",
+            "Precision@top20%",
+            "Lift@top20%",
+            "Recall clase 0",
+        ],
+    )
+    _save_table_figure(
+        roll_ranking_metrics,
+        out_path=BASE_DIR / "final_rollout_ranking_metrics.png",
+        title=f"Final Roll-out — Métricas para señal top 20% ({HORIZON}m)",
+    )
+    _save_table_figure(
+        roll_threshold_cm,
+        out_path=BASE_DIR / "final_rollout_confusion_matrix_thresholds.png",
+        title=f"Final Roll-out — Confusion matrix por threshold ({HORIZON}m)",
+    )
 
     roll_plot_df = pd.DataFrame(
         {
@@ -1937,7 +2073,7 @@ else:
     # ==============================
     # ROI: Buy&Hold DCA vs Señal (2x cuando pred=1) — Final Roll-out
     # ==============================
-    roll_signal = roll_plot_df[["date", "proba_up"]].copy()
+    roll_signal = roll_plot_df[["date", "pred"]].copy()
     roll_signal["date"] = pd.to_datetime(roll_signal["date"])
     roll_signal = roll_signal.set_index("date").sort_index()
 
@@ -1947,15 +2083,15 @@ else:
         name="Close",
     ).sort_index()
 
-    proba_aligned_roll = roll_signal["proba_up"].reindex(prices_eval_roll.index)
+    pred_aligned_roll = roll_signal["pred"].reindex(prices_eval_roll.index)
 
     # Comparación justa: usar SOLO los meses con predicción.
-    has_pred_roll = proba_aligned_roll.notna()
+    has_pred_roll = pred_aligned_roll.notna()
     prices_eval_roll = prices_eval_roll.loc[has_pred_roll]
-    proba_aligned_roll = proba_aligned_roll.loc[has_pred_roll]
+    pred_aligned_roll = pred_aligned_roll.loc[has_pred_roll]
 
     contrib_bh_roll = pd.Series(monthly_amount, index=prices_eval_roll.index)
-    contrib_signal_roll = monthly_amount * float(signal_multiplier) * np.clip(proba_aligned_roll.astype(float), 0.0, 1.0).fillna(0.0)
+    contrib_signal_roll = monthly_amount * float(signal_multiplier) * (pred_aligned_roll.astype(int) == 1).astype(float)
 
     bh_curve_roll = simulate_monthly_dca_roi(prices_eval_roll, contrib_bh_roll)
     sig_curve_roll = simulate_monthly_dca_roi(prices_eval_roll, contrib_signal_roll)
@@ -1970,7 +2106,7 @@ else:
     ax.plot(
         sig_curve_roll.index,
         sig_curve_roll["roi_pct"],
-        label=f"Señal (comprar entre 0x y {signal_multiplier:g}x según P(sube))",
+        label=f"Señal (clase 1: {signal_multiplier:g}x, clase 0: 0x)",
         color="purple",
     )
 
@@ -1985,7 +2121,7 @@ else:
     plt.savefig(BASE_DIR / "roi_strategies_final_rollout.png")
 
     print("\n[FinalRollout ROI] ROI final Buy&Hold DCA (%):", float(bh_curve_roll["roi_pct"].dropna().iloc[-1]))
-    print("[FinalRollout ROI] ROI final Señal (proba) (%):", float(sig_curve_roll["roi_pct"].dropna().iloc[-1]))
+    print("[FinalRollout ROI] ROI final Señal (clase) (%):", float(sig_curve_roll["roi_pct"].dropna().iloc[-1]))
     print("[FinalRollout ROI] Total invertido Buy&Hold:", float(bh_curve_roll["invested"].dropna().iloc[-1]))
     print("[FinalRollout ROI] Total invertido Señal:", float(sig_curve_roll["invested"].dropna().iloc[-1]))
 
@@ -2032,6 +2168,12 @@ print(f"P(sube) en {HORIZON} meses:", final_proba)
 final_proba_all = final_model.predict_proba(X)[:, 1]
 final_logloss = float(_binary_logloss(y.values, final_proba_all))
 final_brier = float(brier_score_loss(y, final_proba_all))
+final_pred_07 = (final_proba_all >= 0.7).astype(int)
+final_base_rate = float(y.mean())
+final_precision_top20 = _precision_at_k(y, final_proba_all, top_frac=0.2)
+final_lift_top20 = _lift_at_k(y, final_proba_all, top_frac=0.2)
+final_recall_0_07 = float(recall_score(y, final_pred_07, pos_label=0, zero_division=0))
+final_threshold_cm = _confusion_matrix_by_thresholds(y, final_proba_all)
 if len(np.unique(y)) > 1:
     final_auc = float(roc_auc_score(y, final_proba_all))
     final_ap = float(average_precision_score(y, final_proba_all))
@@ -2048,8 +2190,40 @@ print("[FinalModel] ROC-AUC:", final_auc)
 print("[FinalModel] PR-AUC:", final_ap)
 print("[FinalModel] LogLoss:", final_logloss)
 print("[FinalModel] Brier:", final_brier)
+print("[FinalModel] Base rate clase 1:", final_base_rate)
+print("[FinalModel] Precision@top20%:", final_precision_top20)
+print("[FinalModel] Lift@top20%:", final_lift_top20)
+print("[FinalModel] Recall clase 0 @0.7:", final_recall_0_07)
 print("[FinalModel] Baseline LogLoss (p const train):", baseline_ll)
 print("[FinalModel] Baseline Brier (p const train):", baseline_br)
+print("\n[FinalModel confusion matrix por threshold]\n", final_threshold_cm)
+
+final_ranking_metrics = pd.DataFrame(
+    {
+        "Valor": [
+            final_base_rate,
+            final_precision_top20,
+            final_lift_top20,
+            final_recall_0_07,
+        ]
+    },
+    index=[
+        "Base rate clase 1",
+        "Precision@top20%",
+        "Lift@top20%",
+        "Recall clase 0 @0.7",
+    ],
+)
+_save_table_figure(
+    final_ranking_metrics,
+    out_path=BASE_DIR / "final_model_ranking_metrics.png",
+    title=f"Final Model — Métricas para señal top 20% ({HORIZON}m)",
+)
+_save_table_figure(
+    final_threshold_cm,
+    out_path=BASE_DIR / "final_model_confusion_matrix_thresholds.png",
+    title=f"Final Model — Confusion matrix por threshold ({HORIZON}m)",
+)
 
 # ==============================
 # SHAP (clasificación binaria)
