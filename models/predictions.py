@@ -1506,9 +1506,9 @@ features = [
     "vol_regime",
     "credit_stress",    
     "liquidity_trend",
+    "high_inflation",
 
 
-    # "high_inflation",
     # "gdp_yoy_lag6",
     # "recession",
     # "rsi_14",
@@ -1578,7 +1578,7 @@ features = valid_features
 print( "features con suficiente historia:", features)
 
 # TARGET  
-min_train_size = 120
+min_train_size = 240
 test_size = 12 
 close_fwd = df["Close"].shift(-HORIZON)
 df["close_fwd"] = close_fwd
@@ -2977,7 +2977,6 @@ top_features = [
     "sp500_earnings_yield",
     "HOUST",
     "unemp_change_12m",
-    "gdp_yoy_lag6"
 ]
 
 for feature in top_features:
