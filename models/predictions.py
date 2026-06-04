@@ -1449,24 +1449,6 @@ short = max(3, h // 2)
 mid   = h                     
 long  = h * 2                 
 
-min_features = [
-    "cape_earnings_yield",
-    "equity_risk_premium",
-    "curve_slope",
-    "DFII10",
-    "FEDFUNDS",
-    "credit_spread",
-    "BAMLH0A0HYM2",
-    "CORESTICKM159SFRBATL",
-    "T10YIE",
-    "gdp_yoy",
-    "unemp_change_12m",
-    "permit_yoy",
-    "balance_yoy",
-    "m2_yoy",
-    "NFCI"
-]
-
 features = [
     "balance_yoy",
     "unemp_change_12m",
@@ -1530,15 +1512,26 @@ features = [
     # f"ema_{long}_dist",
     # f"roc_{HORIZON}",
 ]
-
 # features = [
 #     "equity_risk_premium",
 #     "credit_spread",
 #     "unemp_change_12m",
 #     "m2_yoy",
 #     "permit_yoy",
+#     "cape_earnings_yield",
+#     "HOUST",
+#     "fund_rate_change_3m",
+#     "earnings_growth_12m",
+#     "sp500_earnings_yield",
+#     "liquidity_impulse",
 # ]
-# features = min_features
+features = [
+    "equity_risk_premium",
+    "credit_spread",
+    "unemp_change_12m",
+    "m2_yoy",
+    "permit_yoy",
+]
 print(f"Number of features: {len(features)}")
 
 
