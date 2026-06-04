@@ -1,55 +1,52 @@
-Fuentes (APIs · Logs · DB)
-        ↓
-     Kafka 
-        ↓
-Spark (Streaming / Batch) 
-        ↓
-MinIO  ←→  Iceberg     
-        ↓         
-      Trino     
-        ↓            
-     BI / Analytics   
+# COMANDOS
 
+## Ejecutar
 
-Airflow  → Orquestación
-Grafana  → Monitorización
-Prometheus → Métricas (prescindible en esta versión)
-
-
-
-
-Airbyte es como kafka pero para apis y dbs
-dbt transformación
-
-Para ML solo quitar Kafka y Streaming 
-
-
-
-
-
-
+```bash
 docker compose up --pull=always --build
+```
 
+## Ejecutar en la carpeta docker
 
-
- 
-EJECUTAR EN LA CARPETA DOCKER
+```bash
 docker compose pull --parallel=false
 docker compose --env-file ../.env up --pull=always --build
+```
 
+## Parar
 
-
-Usa:
-
-docker compose down
-o incluso mejor:
+```bash
 docker compose stop
-NO:
-docker compose down -v --remove-orphans
+```
 
+## Alternativa
+
+```bash
+docker compose down
+```
+
+## No usar
+
+```bash
+docker compose down -v --remove-orphans
+```
+
+## Consultar
+
+```bash
 docker volume ls
 docker compose logs -f backend
 docker compose ps
-docker compose exec NOMBRE bash
+```
 
+## Entrar en un contenedor
+
+```bash
+docker compose exec NOMBRE bash
+```
+
+## Ver password de Airflow
+
+```bash
 docker compose exec -it airflow cat simple_auth_manager_passwords.json.generated
+```
