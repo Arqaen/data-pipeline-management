@@ -12,6 +12,7 @@ raw/*.csv
 *.xls
 *.xlsx
 data/*
+*.csv
 metrics/*
 spark-warehouse/
 metastore_db/

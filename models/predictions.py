@@ -241,6 +241,43 @@ def simulate_monthly_dca_roi(
         index=prices.index,
     )
 
+def simulate_value_averaging_modified_roi(
+    prices: pd.Series,
+    monthly_amount: float,
+) -> pd.DataFrame:
+    prices = prices.astype(float)
+    base_amount = float(monthly_amount)
+
+    rows = []
+    shares = 0.0
+    invested = 0.0
+
+    for t, (date, price) in enumerate(prices.items(), start=1):
+        portfolio_value_before = shares * float(price)
+        target_value = base_amount * float(t)
+        contribution = min(max(target_value - portfolio_value_before, base_amount), 3.0 * base_amount)
+
+        shares_bought = contribution / float(price) if float(price) > 0 else 0.0
+        shares += shares_bought
+        invested += contribution
+        value = shares * float(price)
+        roi_pct = (value - invested) / invested * 100.0 if invested > 0 else np.nan
+
+        rows.append(
+            {
+                "price": float(price),
+                "target_value": target_value,
+                "portfolio_value_before": portfolio_value_before,
+                "contribution": contribution,
+                "invested": invested,
+                "shares": shares,
+                "value": value,
+                "roi_pct": roi_pct,
+            }
+        )
+
+    return pd.DataFrame(rows, index=prices.index)
+
 def correlation_report(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     corr = df[cols].corr()
     return corr
@@ -2343,6 +2380,7 @@ contrib_signal = monthly_amount * float(signal_multiplier) * (pred_aligned.astyp
 
 bh_curve = simulate_monthly_dca_roi(prices_eval, contrib_bh)
 sig_curve = simulate_monthly_dca_roi(prices_eval, contrib_signal)
+va_curve = simulate_value_averaging_modified_roi(prices_eval, monthly_amount)
 
 fig, ax = plt.subplots(figsize=(14, 5))
 ax.plot(bh_curve.index, bh_curve["roi_pct"], label=f"Buy&Hold DCA (x={monthly_amount:g}/mes)", color="tab:blue")
@@ -2352,9 +2390,15 @@ ax.plot(
     label=f"Señal (clase 1: {signal_multiplier:g}x, clase 0: 0x)",
     color="purple",
 )
+ax.plot(
+    va_curve.index,
+    va_curve["roi_pct"],
+    label=f"Value Averaging Modified (x={monthly_amount:g}/mes, min=x, max=3x)",
+    color="tab:green",
+)
 
 ax.axhline(0, linestyle="--", color="grey", alpha=0.6)
-ax.set_title(f"ROI acumulado (%) — DCA mensual vs Señal (Walk-Forward, horizonte {HORIZON}m)")
+ax.set_title(f"ROI acumulado (%) — DCA mensual vs Señal vs Value Averaging Modified (Walk-Forward, horizonte {HORIZON}m)")
 ax.set_ylabel("ROI (%)")
 ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 ax.xaxis.set_major_locator(mdates.YearLocator(2))
@@ -2365,6 +2409,7 @@ plt.savefig(BASE_DIR / "roi_strategies_walk_forward.png")
 
 print("\nROI final Buy&Hold DCA (%):", float(bh_curve["roi_pct"].dropna().iloc[-1]))
 print("ROI final Señal (clase) (%):", float(sig_curve["roi_pct"].dropna().iloc[-1]))
+print("ROI final Value Averaging Modified (%):", float(va_curve["roi_pct"].dropna().iloc[-1]))
 # print("Total invertido Buy&Hold:", float(bh_curve["invested"].dropna().iloc[-1]))
 # print("Total invertido Señal:", float(sig_curve["invested"].dropna().iloc[-1]))
 
