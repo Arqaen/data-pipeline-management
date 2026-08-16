@@ -1,37 +1,73 @@
-# Data Platform & Financial Analytics Pipeline
+# Data Engineering & Financial ML Platform
 
 ![Status](https://img.shields.io/badge/status-active%20development-orange)
 ![Orchestration](https://img.shields.io/badge/orchestration-Apache%20Airflow-017CEE)
 ![Processing](https://img.shields.io/badge/processing-Apache%20Spark-E25A1C)
 ![Streaming](https://img.shields.io/badge/streaming-Apache%20Kafka-231F20)
 ![Storage](https://img.shields.io/badge/storage-MinIO-C72E49)
+![ML](https://img.shields.io/badge/ML-XGBoost%20%2B%20SHAP-189AB4)
 
-A local, Docker-based data platform demonstrating an end-to-end lakehouse workflow: synthetic events are generated, published to Kafka, processed by scheduled Spark jobs orchestrated with Airflow, and stored in MinIO as partitioned Parquet data.
+An end-to-end portfolio project combining **data engineering** and **applied machine learning**: a Docker-based lakehouse pipeline for event data, plus an independent financial research workflow for time-aware modelling, explainability, and strategy backtesting.
 
-The repository also contains an independent financial analytics and machine learning module covering historical market analysis, XGBoost modelling, evaluation, SHAP explainability, and investment-strategy simulations.
+The project demonstrates how I design reproducible data infrastructure, transform raw events into typed and partitioned datasets, and evaluate predictive models without breaking the temporal structure of financial data.
 
-> Developed as a final-year project for learning, experimentation, and portfolio demonstration. It is not intended for production deployment or financial advice.
+> Built as a final-year project for learning, experimentation, and portfolio demonstration. It is not production infrastructure or financial advice.
 
-## Architecture
+## What this project demonstrates
+
+| Data Engineering | Data Science & ML |
+| --- | --- |
+| Containerised local infrastructure with Docker Compose | Financial and macroeconomic data preparation |
+| Event ingestion and buffering with Apache Kafka | Feature engineering for time-series classification |
+| Workflow orchestration with Apache Airflow | Chronological walk-forward validation |
+| Distributed processing with Apache Spark | XGBoost modelling and calibration analysis |
+| S3-compatible, partitioned Parquet storage in MinIO | SHAP-based model explainability |
+| Bronze/Silver/Gold lakehouse design | Strategy simulation and risk/turnover metrics |
+
+## Architecture and workflows
+
+The repository contains two complementary but operationally independent workstreams.
+
+### 1. Data engineering platform
 
 ```mermaid
 flowchart LR
-    P1[Event Producer 1] --> K[Apache Kafka\n`events` topic]
-    P2[Event Producer 2] --> K
-    K --> S[Apache Spark\nBronze batch job]
-    A[Apache Airflow\nDAG scheduler] --> S
-    S --> M[MinIO Object Storage\nbronze / silver / gold]
-    A --> PG[(PostgreSQL\nAirflow metadata)]
+    P[Python event producers] --> K[Apache Kafka<br/>events topic]
+    A[Apache Airflow<br/>DAG scheduler] --> S[Apache Spark<br/>Bronze job]
+    K --> S
+    S --> B[(MinIO<br/>Bronze Parquet)]
+    B -. planned .-> V[(Silver<br/>clean and validated)]
+    V -. planned .-> G[(Gold<br/>analytics-ready)]
+    A --> PG[(PostgreSQL<br/>Airflow metadata)]
     Z[ZooKeeper] --> K
 ```
 
-### Data flow
+Two producers generate JSON events and publish them to Kafka. Airflow schedules a Spark batch job, which reads the configured time window, applies a typed schema, creates calendar partitions, and appends the resulting Parquet dataset to MinIO.
 
-1. Two Python producers generate synthetic user events every second.
-2. Events are published as JSON messages to the Kafka `events` topic.
-3. Airflow schedules the `lakehouse_pipeline` DAG using the `WINDOW` setting.
-4. Spark parses the messages, filters the configured time window, and adds calendar partitions.
-5. The Bronze dataset is appended to MinIO in Parquet format under `s3a://bronze/eventos_batch`.
+### 2. Financial ML research
+
+```mermaid
+flowchart LR
+    D[Market and macro data] --> F[Monthly alignment<br/>and feature engineering]
+    F --> W[Purged walk-forward<br/>validation]
+    W --> X[XGBoost classifier]
+    X --> E[Metrics, calibration<br/>and SHAP explanations]
+    X --> T[Historical strategy<br/>simulations]
+```
+
+This workflow runs as standalone research code under [`models/`](models/); it is not currently orchestrated by Airflow or connected to the lakehouse pipeline.
+
+## Implementation status
+
+| Area | Status | Available today |
+| --- | --- | --- |
+| Local infrastructure | Implemented | Docker Compose services for Airflow, Kafka, Spark, MinIO, PostgreSQL, and ZooKeeper |
+| Event ingestion | Implemented | Two synthetic Python producers and Kafka topic initialisation |
+| Bronze layer | Implemented | Time-windowed Kafka processing and partitioned Parquet writes to MinIO |
+| Silver and Gold layers | Scaffolding | Spark files and MinIO buckets exist; transformations are planned |
+| Financial data acquisition | Implemented | Standalone scripts for selected market and macroeconomic series |
+| Financial modelling | Implemented research workflow | Feature engineering, XGBoost, walk-forward evaluation, calibration, and SHAP |
+| Strategy comparison | Implemented research workflow | Rule-based, DCA, and modified value-averaging simulations |
 
 ## Technology stack
 
@@ -40,47 +76,34 @@ flowchart LR
 | Docker Compose | Reproducible local infrastructure |
 | Apache Airflow | Workflow orchestration and scheduling |
 | Apache Kafka | Event streaming and buffering |
-| Apache Spark | Batch data processing |
+| Apache Spark | Distributed batch processing |
 | MinIO | S3-compatible object storage |
 | PostgreSQL | Airflow metadata database |
-| ZooKeeper | Kafka coordination for this local setup |
+| ZooKeeper | Kafka coordination in the local environment |
 | Python | Producers, utilities, and financial analytics |
-| XGBoost and SHAP | Modelling and explainability |
+| XGBoost and SHAP | Classification and model explainability |
 
-## Repository structure
+## Repository map
 
 ```text
 airflow/dags/             Airflow DAG definitions
 docker/                   Dockerfiles and Compose configuration
 kafka/                    Synthetic Kafka event producer
-models/                   Financial analysis and machine learning scripts
-spark/                    Spark jobs and Spark configuration
-sql/                     MinIO initialization utilities
+models/                   Financial data, ML, and strategy scripts
+spark/                    Bronze job, future Silver/Gold jobs, and Spark config
+sql/                      MinIO initialisation utilities
 .env.example              Required environment variables
 ```
 
-## Current scope
+## Quick start
 
-The Bronze layer is implemented. The Silver and Gold Spark files are currently scaffolding for future transformations.
-
-Included:
-
-- Docker Compose environment for the complete local platform.
-- Airflow DAG for scheduling and submitting Spark jobs.
-- Kafka producers and topic initialization.
-- Spark master, workers, and a Kafka-to-MinIO Bronze job.
-- MinIO buckets for `bronze`, `silver`, and `gold`.
-- Independent financial modelling and evaluation scripts.
-
-## Prerequisites
+### Prerequisites
 
 - Docker Desktop with Docker Compose v2.
 - At least 8 GB of RAM allocated to Docker is recommended.
-- Python 3.10+ for running standalone financial scripts outside the containers.
+- Python 3.10+ to run the standalone financial scripts outside the containers.
 
-## Quick start
-
-Create the environment file:
+Create the local environment file:
 
 ```bash
 cp .env.example .env
@@ -92,7 +115,7 @@ On Windows PowerShell:
 Copy-Item .env.example .env
 ```
 
-Review `.env`. The Compose configuration expects MinIO credentials, an Airflow username, and a scheduling window:
+Review `.env` before starting. The Compose setup expects MinIO credentials, an Airflow username, and a scheduling window:
 
 ```dotenv
 MINIO_ROOT_USER=minioadmin
@@ -107,57 +130,27 @@ Start the platform from the repository root:
 docker compose -f docker/docker-compose.yml --env-file .env up --build
 ```
 
-To run it in the background:
+Add `-d` before `--build` to run it in the background.
 
-```bash
-docker compose -f docker/docker-compose.yml --env-file .env up -d --build
-```
-
-## Local service endpoints
+### Local services
 
 | Service | URL or address | Purpose |
 | --- | --- | --- |
 | Airflow | http://localhost:8081 | Workflow UI |
-| Spark Master UI | http://localhost:8080 | Cluster and job status |
+| Spark Master | http://localhost:8080 | Cluster and job status |
 | MinIO API | http://localhost:9000 | S3-compatible endpoint |
 | MinIO Console | http://localhost:9001 | Object storage UI |
 | Kafka | `localhost:9092` | Local broker endpoint |
 
 Use the credentials configured in `.env`.
 
-## Useful commands
+## Engineering highlights
 
-```bash
-# Check running services
-docker compose -f docker/docker-compose.yml ps
+### Orchestrated event processing
 
-# Follow all logs
-docker compose -f docker/docker-compose.yml logs -f
+[`airflow/dags/lakehouse_pipeline.py`](airflow/dags/lakehouse_pipeline.py) defines the `lakehouse_pipeline` DAG and submits the Bronze Spark job with the Kafka, MinIO, and time-window configuration.
 
-# Follow a specific service
-docker compose -f docker/docker-compose.yml logs -f airflow
-
-# Stop containers without removing data volumes
-docker compose -f docker/docker-compose.yml stop
-
-# Stop and remove containers and networks
-docker compose -f docker/docker-compose.yml down
-
-# Open a shell inside a running container
-docker compose -f docker/docker-compose.yml exec airflow bash
-```
-
-Avoid `docker compose down -v` unless you intentionally want to delete local database and storage volumes.
-
-## Key implementation details
-
-### Airflow DAG
-
-[`airflow/dags/lakehouse_pipeline.py`](airflow/dags/lakehouse_pipeline.py) defines the `lakehouse_pipeline` DAG and submits the Bronze Spark job with Kafka, MinIO, and time-window configuration.
-
-### Kafka producer
-
-[`kafka/kafka_producer.py`](kafka/kafka_producer.py) publishes JSON events to the `events` topic:
+[`kafka/kafka_producer.py`](kafka/kafka_producer.py) publishes synthetic events such as:
 
 ```json
 {
@@ -168,36 +161,61 @@ Avoid `docker compose down -v` unless you intentionally want to delete local dat
 }
 ```
 
-### Spark Bronze job
+[`spark/spark_bronze.py`](spark/spark_bronze.py) parses each payload into a typed schema, filters it using the Airflow-provided window, derives `year`, `month`, `day`, and `hour` partitions, and appends Parquet data to `s3a://bronze/eventos_batch`.
 
-[`spark/spark_bronze.py`](spark/spark_bronze.py):
+### Time-aware financial modelling
 
-- Reads Kafka messages in batch mode.
-- Parses the JSON payload into a typed Spark schema.
-- Filters events by the Airflow-provided time window.
-- Adds `year`, `month`, `day`, and `hour` partitions.
-- Writes append-only Parquet data to `s3a://bronze/eventos_batch`.
+The research workflow deliberately uses chronological evaluation rather than a random train/test split:
 
-### Financial analytics
+1. [`get_data.py`](models/get_data.py) acquires selected historical market and macroeconomic series.
+2. [`predictions.py`](models/predictions.py) aligns them to a monthly frequency and builds lagged, macroeconomic, valuation, momentum, and technical features.
+3. A forward-return label is created for the configured horizon and excluded from the predictors.
+4. Purged walk-forward folds train on past observations and evaluate on later periods.
+5. Out-of-sample predictions are assessed with classification, calibration, stability, risk, and turnover metrics.
+6. A final model produces feature-importance and SHAP explanations for interpretation.
+7. [`compare_strategies_simple.py`](models/compare_strategies_simple.py) compares moving-average and RSI rules with DCA and modified value averaging.
 
-The scripts in [`models/`](models/) are independent from the streaming pipeline. They cover historical data acquisition, time-aware classification/regression workflows, calibration and risk metrics, SHAP explanations, and DCA/value-averaging simulations.
+Generated research artefacts include CSV summaries and diagnostic, calibration, feature-importance, SHAP, and strategy-comparison charts. No performance figure is presented here because results depend on the selected data, horizon, parameters, costs, and evaluation period.
 
-## Development roadmap
+## Useful commands
 
-- Implement Silver transformations for cleaning, validation, and deduplication.
-- Add Gold aggregates and analytics-ready tables.
-- Add data quality checks and automated tests.
-- Add observability for pipeline runs and data freshness.
-- Replace the local ZooKeeper-based Kafka setup with a production-ready coordination approach.
-- Add dependency lockfiles for the financial analytics environment.
+```bash
+# Check running services
+docker compose -f docker/docker-compose.yml ps
 
-## Notes and limitations
+# Follow all logs
+docker compose -f docker/docker-compose.yml logs -f
 
-- This is a local development environment; change default credentials before any shared or exposed deployment.
+# Follow one service
+docker compose -f docker/docker-compose.yml logs -f airflow
+
+# Stop containers without removing them
+docker compose -f docker/docker-compose.yml stop
+
+# Stop and remove containers and networks
+docker compose -f docker/docker-compose.yml down
+```
+
+Avoid `docker compose down -v` unless you intentionally want to delete the local database and object-storage volumes.
+
+## Limitations
+
+- The platform is designed for local development, not production deployment.
+- Kafka runs as a single broker with replication factor one and ZooKeeper coordination.
 - MinIO uses HTTP inside the Docker network.
-- Kafka runs as a single broker with replication factor one.
-- Financial models are research artefacts, not investment recommendations.
+- Silver and Gold transformations are not implemented yet.
+- The financial workflows are research artefacts, not live trading systems or investment recommendations.
+- Historical simulations remain sensitive to data quality, parameter selection, transaction costs, and market-regime changes.
+
+## Roadmap
+
+- Implement Silver cleaning, validation, and deduplication.
+- Build Gold aggregates and analytics-ready tables.
+- Add automated data-quality checks and tests.
+- Add pipeline observability and freshness monitoring.
+- Replace the local ZooKeeper-based Kafka setup with a production-oriented coordination approach.
+- Add a locked and reproducible dependency definition for the financial environment.
 
 ## License
 
-No license has been specified yet. Add one before distributing or reusing this project publicly.
+This project is licensed under the [MIT License](LICENSE).
